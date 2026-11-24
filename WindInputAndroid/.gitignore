@@ -1,0 +1,20 @@
+# Gradle / Android 构建产物（一机一份，不入库）
+.gradle/
+.kotlin/
+local.properties
+captures/
+.cxx/
+.externalNativeBuild/
+app/build/
+
+# Rust 交叉编译产物与 UniFFI 生成物（由 scripts/ 重新生成）
+app/src/main/jniLibs/
+app/src/main/java/uniffi/
+
+# 打包/签名产物与密钥
+*.apk
+*.aab
+*.jks
+*.keystore
+keystore/
+keystore.properties

@@ -15,6 +15,7 @@ members = [
     "crates/wind-ui-types",
     "crates/wind-host",
     "crates/wind-mobile",
+    "crates/wind-android",
     "crates/wind-ui",
     "crates/wind-scene",
     "crates/wind-scene-wasm",

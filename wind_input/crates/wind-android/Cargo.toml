@@ -1,0 +1,32 @@
+[package]
+name = "wind-android"
+version.workspace = true
+edition.workspace = true
+
+# Android 平台绑定层：只经 wind-mobile 一条 path 依赖对接核心。
+# UniFFI 与镜像 FFI 类型在本 crate 内，核心/wind-mobile 不沾绑定框架。
+[lib]
+name = "wind_android"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+wind-mobile = { path = "../wind-mobile" }
+wind-host = { path = "../wind-host" }
+uniffi = { version = "0.32" }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
+# 只在 host 上生成 Kotlin 绑定时启用；Android/移动端构建不要开，否则会把 uniffi-bindgen
+# 及其依赖一起编进目标三元组（很慢，且 CLI 与运行时无关）。
+cli = ["uniffi/cli"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]

@@ -1,0 +1,1338 @@
+# 清风输入法 Android 版 —— 方案与架构设计
+
+> 版本：v1.7（T9 融合/设置/性能兼容记录）　日期：2026-11-24
+> 依托：现有 `windinput-android-dev` 仓库（Rust 跨平台输入法框架「清风输入法 WindInput」）
+> 目标：开发 Android 版清风输入法，先落地拼音 + 英文输入，具备剪贴板与常用语，UI 简洁（参照豆包/微信输入法），为语音识别与本地大模型识别预留扩展位。
+
+---
+
+## 0. v1.1 审查修正记录
+
+本版基于对框架源码的二次核实，修正了 v1.0 中与实际能力不符的设计，并补充扩展性、稳定性、界面规范。主要修正：
+
+| # | v1.0 的问题 | v1.1 的修正 | 依据 |
+|---|---|---|---|
+| 1 | 常用语新建 `PhraseStore(redb)` | **复用** `MobileCore::phrases/phrase_add/phrase_remove/phrase_set_enabled/phrases_restore_defaults`，数据落 `wind-store`，与桌面设置页同一份 | `wind-mobile/src/lib.rs` 已有完整短语 API |
+| 2 | 称 Android 只需实现 `HostSession` trait | 修正：`HostSession` 当前**无任何实现**；Android 实际走 `MobileCore` 具名方法，`wind-host` 类型是契约 | 全仓 `grep "impl HostSession"` 为空 |
+| 3 | 假设 `MobileCore` 已有 `readiness/snapshot/set_host_services` | 明确这些只在 `Coordinator` 上，需给 `wind-mobile` 补**薄门面**（4 个方法） | `wind-mobile` 公开 API 清单核实 |
+| 4 | `user_root` 放 `Android/data` 供用户编辑 | 改为 `filesDir` + SAF 导入导出（Android 11+ 分区存储已无法直接访问 `Android/data`） | Android 存储模型 |
+| 5 | 剪贴板/常用语经 `press_literal` 上屏 | 改为宿主直接执行 `EditOp::Commit`；`press_literal` 只用于文本缓冲模式 | `touch.rs` 实现核实 |
+| 6 | 未提 9 键拼音 | 明确 Phase 1 只做 26 键；9 键列为 Phase 2 **引擎级**工作并给出方案 | 引擎无 T9 代码 |
+| 7 | `InputSource::produce()` 同步一次性 | 改为异步事件驱动会话；大模型定位为 `CandidateEnhancer` | 语音/LLM 的异步本质 |
+| 8 | "所有调用放后台线程" | 改为**单输入线程串行管线** + 主线程按序执行 + 延迟预算 | 防乱序/ANR |
+| 9 | 未提 InputConnection 失效防护 | 增加判空、`isActive`、异常兜底、`beginBatchEdit` | Android 稳定性 |
+| 10 | 未设计键盘布局数据模型 | 新增 `KeyboardLayout` 数据驱动模型（26/9/符号/表情） | 可扩展性 |
+| 11 | 无设置页/引导页 | 新增设置与引导章节，复用已有配置/词库/统计/主题 API | `wind-mobile` API 清单 |
+| 12 | 未利用候选注释/长按菜单/表情 | 补入候选交互与表情/符号面板 | `CandidateWindow.comments`、`candidate_menu`、`emoji_modules` |
+| 13 | 未处理 `CandidateWindow.rebuilt` | 补入"整份重取"规则 | `candidate_pull.rs` 注释 |
+| 14 | 稳定性只提 ANR | 补 `onTrimMemory`、进程重建、看门狗、数据完整性 | 移动端工程实践 |
+| 15 | 构建细节缺失 | 补多 ABI、16KB page、UniFFI 锁定、minSdk、体积预算、CI | Android 15+ 要求 |
+
+### 0.1 已确认决策（2026-11-24，用户拍板）
+
+| 决策项 | 结论 |
+|---|---|
+| UI 技术 | **混合**：键盘面/候选栏自定义 View，设置页/面板 Jetpack Compose |
+| 键盘路线 | **先 26 键，后 9 键**；9 键列为 Phase 2（引擎级） |
+| 范围策略 | **先做最小集，后续再完善**；本文 §4.10 列出可选项供勾选 |
+| 剪贴板 | **默认关闭**，用户在设置中开启；与**常用语同一界面，顶部 Tab 切换** |
+| Android 版本 | 支持 **Android 8.0（minSdk 26）及以上**，不支持 8.0 以下 |
+| 常用语 | **编码短语 + 点击即上屏面板**，两者数据同源（复用 `wind-store` 短语系统） |
+| UI 参考 | 参照用户提供的微信输入法截图（布局和显示、按键效果、辅助输入、剪贴板、隐私与权限、主设置、工具栏、键盘）；代码与设计全部自研，不复制素材/源码 |
+
+### 0.2 功能范围勾选结果（2026-11-24）
+
+| 范围 | 已选功能 |
+|---|---|
+| **P1 最小集** | 26 键拼音/英文、候选栏/编码栏、中英/标点/全半角/简繁、联想（默认）、候选字号、键盘高度、深色模式、拼音显示位置、表情键、声音开关、触感开关、剪贴板（默认关）、常用语（与剪贴板同界面 Tab）、表情/符号面板、主设置页、布局与显示页、按键效果页、剪贴板/常用语页、键盘管理（仅拼音/英文）、隐私页、关于、单机模式说明、首次引导 |
+| **P1.5（本期追加）** | 候选长按菜单、候选注释/拼音提示、按键气泡、触感强度滑杆、个人词典管理页 |
+| **Phase 2（9 键阶段，全选）** | 9 键拼音、九宫格数字/侧边栏/上滑数字、模糊拼音、英文首字母大写/双击空格句号/英文自动纠错、中文与数字/英文间加空格、回车键发送、工具栏定制、单手模式、悬浮键盘/键盘调节、主题包/皮肤 |
+| **Phase 3（语音优先）** | 语音转文字；手写找字、边写边译随后 |
+| **Phase 4** | 本地大模型候选增强/润色（按评估） |
+| **未选/暂缓** | 统计页、备份/还原/换机助手、短信验证码自动填充、拼写 Plus、跨设备同步、小程序/隔空传送、AI 录音笔/问 AI/文字整理/灵动表达、字体滤镜/排版成图、滑行输入 |
+| **不做** | 云同步/账号、跨设备粘贴同步、小程序/隔空传送、字体滤镜/排版成图 |
+
+---
+
+## 1. 背景与目标
+
+### 1.1 现有框架情况（已核实）
+
+`windinput-android-dev` 是一个**已完成跨平台架构**的 Rust 输入法框架：
+
+- **核心完全平台无关**：引擎（`wind-engine`）、词库（`wind-dict`）、候选（`wind-candidate`）、配置（`wind-config`）、协调器（`wind-coordinator`）等纯逻辑 crate 平台相关行 = 0。
+- **拼音 / 英文引擎已完整存在**：
+  - 拼音：`wind-engine/src/pinyin/`（Viterbi 解码、整句模型、模糊音、纠错、双拼等），方案数据在 `data/schemas/pinyin`。
+  - 英文：`wind-engine/src/english.rs` / `english_phrase.rs`（英文词组、自动空格），方案数据在 `data/schemas/english`。
+  - 五笔、双拼、笔画等方案也已就绪，后续可直接启用，不在本期范围。
+- **移动端门面已就绪**：`wind-mobile` crate 把移动端要用的能力聚合成**一条依赖边**。
+- **宿主语义类型已定义**：`wind-host` 定义了 `KeyProbe`/`KeyOutcome`/`EditOp`/`InputSnapshot`/`Readiness` 等薄宿主语义类型。
+- **剪贴板已有注入缝**：`Coordinator::set_host_services` 可注入 `HostServices`，headless 默认 `NullHostServices`。
+- **编译门已就绪**：`cargo check-android` 守护依赖闭包；本机已装好 Rust + Android target + NDK + SDK。
+
+**结论**：Android 版不是从零开发，而是**新建平台绑定层**，把已有的核心能力「接出来」。这是本方案的核心判断。
+
+### 1.2 本期目标（Phase 1 最小集）
+
+1. **主体框架搭建**：Android 平台绑定层（Rust `wind-android` crate + Kotlin 宿主）落地，打通「按键 → 引擎 → 候选 → 上屏」全链路。
+2. **26 键拼音 + 英文**：全拼、简繁、中英切换、中文/英文标点、全半角；英文直出与自动空格。
+3. **键盘与候选**：26 键 QWERTY、候选栏、编码栏、工具栏、符号/数字层、表情入口。
+4. **剪贴板 + 常用语（同一面板，顶部 Tab）**：剪贴板默认关闭、用户开启；常用语复用现有短语系统，支持点击上屏与编码触发。
+5. **最小设置页 + 引导页**：键盘高度、候选字号、深色模式、声音/触感、拼音显示位置、表情键开关；首次启用/切换输入法引导。
+6. **UI 基线**：参照用户提供的微信输入法截图（简洁、克制、状态驱动），代码与设计全部自研。
+
+**最小集之外的项**（布局和显示中的数字键盘/九宫格侧边栏、按键气泡、辅助输入、工具栏定制、语音/手写/翻译/AI 等）见 §4.10 功能清单，由用户勾选后纳入 Phase 1.5/2。
+
+### 1.3 后续阶段目标
+
+- **Phase 2：9 键拼音**（引擎级，见 §5.2）+ 9 宫格数字/侧边栏/上滑数字 + 模糊拼音设置。
+- **Phase 3：语音识别**：异步输入源，未来接入本地/云端识别。
+- **Phase 4：本地大模型**：作为候选增强器（rerank/联想/润色），不作为主输入源。
+- **持续**：手写/滑行输入、主题包/布局包/词库包、工具栏定制、统计/备份/换机助手等。
+
+### 1.4 非目标
+
+- 不照搬任何开源安卓输入法的源码或素材（仅参考功能与交互思路，规避版权/许可纠纷）。
+- 本期不做五笔、双拼、笔画等桌面已有但移动端非必需的方案（架构上已支持，后续可平滑启用）。
+- 本期不做 9 键、手写、滑行输入（Phase 2）。
+- 不做云同步、账号体系、跨设备粘贴同步、小程序/隔空传送。
+- 不做 AI 录音笔、问 AI、文字整理/灵动表达等 AI 功能（Phase 4 评估）。
+- 不做皮肤/主题编辑器（先做主题包加载，编辑器后续）。
+- 不支持 Android 8.0 以下（minSdk 26）。
+
+---
+
+## 2. 总体架构
+
+### 2.1 分层总览
+
+沿用框架既有的平台分层策略，Android 版分四层：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Kotlin 宿主层（Android 原生）                                     │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ WindImeService (InputMethodService)                         │  │
+│  │  · 按键/触摸事件 → MobileCore.press / key_down              │  │
+│  │  · EditOp → InputConnection（上屏/组合区/删改/移光标）       │  │
+│  │  · 实现 MobileEventSink（候选/状态/提示回调）                │  │
+│  │  · 实现 HostServices（剪贴板）                               │  │
+│  │  · 键盘视图 + 候选栏 + 工具栏 + 面板（符号/表情/剪贴板/常用语）│  │
+│  ├────────────────────────────────────────────────────────────┤  │
+│  │ SettingsActivity / OnboardingActivity / 诊断与关于页         │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                        ↕ UniFFI（C ABI + JNA）                     │
+├──────────────────────────────────────────────────────────────────┤
+│  Rust 平台绑定层：wind-android crate（新建）                       │
+│  · UniFFI 接口定义与导出（cdylib → libwind_android.so）            │
+│  · MobileCore 进程内装配；单输入线程；日志接 logcat                 │
+│  · HostServices 桥接（Kotlin ClipboardManager）                     │
+│  · 扩展点注册表（语音/LLM/布局，Phase 2 填充）                      │
+├──────────────────────────────────────────────────────────────────┤
+│  Rust 移动端门面：wind-mobile（已有，需补 4 个薄 API）              │
+│  · MobileCore：按键翻译、预热、配置、候选、短语、主题、统计、设置    │
+│  · MobileCommand / MobileEventSink / InputStatus                   │
+│  · 扩展 trait：InputSource / CandidateEnhancer（新增，平台无关）     │
+├──────────────────────────────────────────────────────────────────┤
+│  Rust 核心层（平台无关，已有，不改）                                │
+│  wind-coordinator / wind-engine / wind-dict / wind-store /         │
+│  wind-candidate / wind-config / wind-ui-types / wind-host …        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 关键架构决策
+
+| 决策点 | 选择 | 理由 |
+|---|---|---|
+| **部署模型** | **进程内嵌入**（Rust 核心作为 `cdylib` 随 APK 加载，Kotlin 同进程直调，无 IPC） | 移动端是单一输入法服务进程，无需 Windows 式多进程；进程内最简单、延迟最低。 |
+| **绑定技术** | **UniFFI** | 框架既定方向；自动生成 Kotlin 接口、类型安全、C ABI。**注意**：UniFFI Kotlin 绑定依赖 JNA（增加约 2MB 与启动初始化），需在体积/启动预算内评估；热路径调用开销为微秒级，可接受。 |
+| **平台绑定层归属** | `wind_input/crates/wind-android`（Rust 绑定层）+ 同级 `WindInputAndroid/`（Kotlin 工程） | 符合框架「平台实现层按 target 编译」「绑定层经 wind-mobile 一条 path 依赖」的立约；与 `wind_tsf`/`wind_macos`/`wind_linux` 对位。 |
+| **UI 技术** | **混合**：键盘面 + 候选栏用**自定义 View/Canvas**（延迟关键路径）；设置页/面板/引导用 **Jetpack Compose** | IME 按键反馈需稳定 <16ms；Compose 在状态高频推送下可能抖动。面板/设置页交互低频，Compose 提效明显。若团队坚持纯 Compose，需锁定不可变状态、隔离键盘重组，并做帧率验证。 |
+| **核心改动边界** | 核心层（engine/dict/coordinator）**不改**；`wind-mobile` 补 4 个薄门面方法 | 需要 `readiness/snapshot/set_host_services/trim_memory` 才能让绑定层完整工作；这是薄转发，不引入平台依赖。 |
+| **常用语** | **复用**现有 `wind-store` 短语系统与 `wind-mobile` API | 已有 `phrase_add/remove/set_enabled/restore_defaults`，与桌面互通；不新建存储层。 |
+| **9 键拼音** | Phase 2（引擎级），Phase 1 仅 26 键 | 当前引擎无 T9 映射；9 键需要按键集合到音节/词条的歧义解码，属于核心能力，不能只靠 UI 层补。 |
+| **语音/大模型** | 语音 = 异步 `InputSource`；大模型 = `CandidateEnhancer` | 语音是"产生文本"，LLM 更多是"重排/预测/润色"；两者扩展面不同，不能混成一个同步 `produce()`。 |
+
+### 2.3 与既有平台宿主的关系
+
+Android 与桌面三平台对位，**职责边界一致**：引擎/词库/候选/配置逻辑全在核心，宿主层只做「按键转发 + 文本上屏 + 候选呈现」，**不做任何中英判定**。
+
+```
+wind_tsf (C++, Windows)  ──┐
+wind_macos (Swift)        ──┤  同一套核心引擎
+wind_linux (C++, Fcitx5)  ──┤
+wind_android (Rust+Kotlin) ─┘  ← 本期新建
+```
+
+### 2.4 已有移动端能力复用清单（避免重复造轮子）
+
+`wind-mobile` 已暴露大量设置与数据 API，Android 端应直接复用。**新增功能前先查此表**：
+
+| 能力 | 已有 API | Android 用途 |
+|---|---|---|
+| 按键 | `press`、`press_literal`、`key_down` | 软键盘/物理键盘 |
+| 候选 | `candidates`、`candidates_with_comments`、`select_candidate`、`select_candidate_plain` | 候选栏/展开面板 |
+| 候选菜单/提示 | `candidate_menu`、`candidate_menu_run`、`candidate_tooltip` | 长按菜单、词条详情 |
+| 候选读法修正 | `leading_readings`、`set_leading_reading` | 多音字/首单元修正 |
+| 模式 | `run_command`、`MobileCommand` | 中英/标点/全半角/简繁/方案切换 |
+| 方案 | `schemas`、`installed_schemas`、`scheme_dirs`、`set_schema_enabled`、`refresh_installed_schemas`、`on_schemes_changed` | 设置页方案管理 |
+| 方案设置 | `SchemaSettings`、`shuangpin_layouts`、`schema_dicts`、`set_schema_dict_enabled`、`quick_mix_members`、`set_quick_mix_members` | 方案详情页 |
+| 配置 | `config_snapshot`、`config_defaults`、`config_registry`、`config_set` | 设置页（可由注册表自动生成 UI） |
+| 用户词 | `user_words`、`user_word_add`、`user_word_remove`、`user_words_clear` | 词库页 |
+| 短语/常用语 | `phrases`、`phrase_add`、`phrase_remove`、`phrase_set_enabled`、`phrases_restore_defaults` | 常用语页/面板 |
+| 词库备份 | `dict_export`、`dict_import`、`dict_stats` | 导入导出（SAF） |
+| 联想 | `assoc_hold`、`assoc_history_count`、`assoc_history_clear` | 联想开关/历史清理 |
+| 统计 | `stats_summary`、`stats_daily`、`stats_clear` | 统计页 |
+| 主题 | `themes`、`set_theme`、`theme_style`、`set_theme_style`、`palette`、`is_dark` | 主题页/键盘配色 |
+| 表情 | `emoji_modules`、`set_emoji_module` | 表情面板 |
+| 符号 | `symbol_keys`、`char_strokes` | 符号面板/笔画（后续） |
+| 分隔符 | `separator_key` | 键盘分词键 |
+| 焦点/上下文 | `focus_gained`、`focus_lost`、`set_preceding_text`、`set_learning_suspended` | 生命周期/联想/无痕 |
+| 自动空格 | `set_auto_space` | 英文设置 |
+| 快捷触发 | `set_touch_quick_trigger` | 触摸 `;` 进快捷输入 |
+
+---
+
+## 3. Rust 侧：wind-android crate
+
+### 3.1 crate 职责
+
+`wind-android` 是**平台绑定层**，职责严格限定在「Rust 核心 ↔ Kotlin 宿主的接缝」，**不含输入逻辑**：
+
+1. **UniFFI 接口定义**：构造、按键、候选、选择、命令、设置、剪贴板注入、事件回调、短语、扩展点。
+2. **MobileCore 装配**：在 `cdylib` 内进程内构造，管理生命周期。
+3. **单输入线程**：所有 `MobileCore` 调用串行化（见 §3.3）。
+4. **日志与崩溃**：`tracing` 接 logcat；panic hook + 兜底。
+5. **HostServices 桥接**：实现 `HostServices`，转发到 Kotlin `AndroidClipboard`。
+6. **扩展点注册表**：`InputSource`/`CandidateEnhancer`（Phase 2 填充）。
+7. **数据目录装配**：`data_dir`（assets 解出）、`user_root`（私有 filesDir）、`local_root`（cache）。
+
+### 3.2 wind-mobile 需要补的薄门面（4 个方法）
+
+以下方法只在 `Coordinator` 上，`MobileCore` 未暴露；绑定层不能直接碰 `debug_coordinator()`（注释明确"宿主不要碰"）。因此在 `wind-mobile` 增加薄转发：
+
+```rust
+impl MobileCore {
+    /// 就绪状态（转发 coord.readiness()）。
+    pub fn readiness(&self) -> Readiness;
+
+    /// 当前输入态快照（用于横竖屏切换/视图重建）。
+    /// 由协调器当前状态构造，不依赖上一帧推送。
+    pub fn snapshot(&self) -> InputSnapshot;
+
+    /// 注入平台剪贴板实现（转发 coord.set_host_services()）。
+    /// 必须在首个可能触碰剪贴板的调用之前调用。
+    pub fn set_host_services(&self, svc: Arc<dyn HostServices>);
+
+    /// 内存紧张时释放闲置方案/缓存（供 Android onTrimMemory 调用）。
+    pub fn trim_memory(&self);
+}
+```
+
+> 这是本方案对 `wind-mobile` 的**唯一改动**，均为薄转发，不引入平台依赖，不影响桌面/未来 iOS。`HostServices` 需从 `wind-mobile` 重新导出（或提供等价 trait），供 `wind-android` 实现。
+
+### 3.3 UniFFI 接口（草案）
+
+接口设计原则：**薄**——只暴露 Kotlin 真正需要的，类型尽量直接透出 `wind-mobile` 已有类型，不另立投影。
+
+```rust
+// wind-android/src/lib.rs（草案）
+
+#[derive(uniffi::Record)]
+pub struct AndroidConfig {
+    pub data_dir: String,        // assets 解出的 data/ 目录
+    pub user_root: String,       // 私有 filesDir/user
+    pub local_root: String,      // 私有 cacheDir/wind
+    pub fallback_schema: String, // 首装兜底，默认 "pinyin"
+}
+
+// 事件回调（Kotlin 实现，Rust 后台线程调回）
+#[uniffi::export(with_foreign)]
+pub trait AndroidEventSink: Send + Sync {
+    fn on_candidates(&self, frame: CandidateFrame);
+    fn on_hide_candidates(&self);
+    fn on_status(&self, status: InputStatus);
+    fn on_toast(&self, text: String);
+}
+
+// 剪贴板（Kotlin 实现，经 HostServices 桥接）
+#[uniffi::export(with_foreign)]
+pub trait AndroidClipboard: Send + Sync {
+    fn set_text(&self, text: String);
+    fn get_text(&self) -> String;
+    fn get_text_cached(&self) -> String; // 绝不阻塞
+}
+
+pub struct WindAndroid { /* core, 单输入线程, host_services */ }
+
+impl WindAndroid {
+    pub fn new(cfg: AndroidConfig, sink: Arc<dyn AndroidEventSink>,
+               clip: Arc<dyn AndroidClipboard>) -> Arc<Self>;
+
+    // 输入
+    pub fn press(&self, key: PressKey, source: KeySource) -> KeyOutcome;
+    pub fn key_down(&self, vk: u32, modifiers: u32) -> KeyOutcome;
+    pub fn candidates(&self, offset: u32, limit: u32) -> CandidateWindow;
+    pub fn candidates_with_comments(&self, offset: u32, limit: u32) -> CandidateWindow;
+    pub fn select_candidate(&self, index: u32) -> KeyOutcome;
+    pub fn candidate_menu(&self, index: u32) -> Vec<CandidateMenuItem>;
+    pub fn candidate_menu_run(&self, index: u32, action: String) -> bool;
+    pub fn candidate_tooltip(&self, index: u32) -> Vec<CandidateTooltipSection>;
+
+    // 模式/状态
+    pub fn run_command(&self, cmd: MobileCommand);
+    pub fn readiness(&self) -> Readiness;
+    pub fn snapshot(&self) -> InputSnapshot;
+
+    // 焦点/上下文
+    pub fn focus_gained(&self);
+    pub fn focus_lost(&self);
+    pub fn set_preceding_text(&self, text: String);
+    pub fn set_learning_suspended(&self, on: bool);
+
+    // 设置/数据（直接转发 wind-mobile）
+    pub fn config_snapshot(&self) -> String;
+    pub fn config_registry(&self) -> Vec<ConfigFieldInfo>;
+    pub fn config_set(&self, key: String, value: ConfigValue) -> Result<(), String>;
+    pub fn schemas(&self) -> Vec<SchemaEntry>;
+    pub fn installed_schemas(&self) -> Vec<InstalledSchema>;
+    pub fn set_schema_enabled(&self, id: String, on: bool) -> Result<(), String>;
+    pub fn user_words(&self, /*…*/) -> UserWordPage;
+    pub fn user_word_add(&self, /*…*/) -> Result<(), String>;
+    pub fn user_word_remove(&self, /*…*/) -> Result<(), String>;
+    pub fn phrases(&self) -> Vec<Phrase>;
+    pub fn phrase_add(&self, code: String, text: String) -> Result<(), String>;
+    pub fn phrase_remove(&self, code: String, text: String) -> Result<(), String>;
+    pub fn phrase_set_enabled(&self, code: String, text: String, on: bool) -> Result<(), String>;
+    pub fn dict_export(&self, schema_id: String) -> Result<String, String>;
+    pub fn dict_import(&self, schema_id: String, content: String, replace: bool)
+        -> Result<DictImportResult, String>;
+    pub fn stats_summary(&self) -> Option<StatsSummary>;
+    pub fn stats_daily(&self, from: String, to: String) -> Vec<DailyTotal>;
+    pub fn stats_clear(&self) -> Result<(), String>;
+    pub fn themes(&self) -> Vec<ThemeEntry>;
+    pub fn set_theme(&self, id: String) -> bool;
+    pub fn theme_style(&self) -> String;
+    pub fn set_theme_style(&self, style: String);
+    pub fn palette(&self, system_dark: bool) -> Vec<PaletteColor>;
+    pub fn is_dark(&self, system_dark: bool) -> bool;
+    pub fn emoji_modules(&self) -> Vec<EmojiModuleState>;
+    pub fn set_emoji_module(&self, id: String, on: bool) -> Result<(), String>;
+    pub fn symbol_keys(&self) -> Vec<(String, char)>;
+    pub fn separator_key(&self) -> Option<char>;
+
+    // 内存
+    pub fn trim_memory(&self);
+}
+```
+
+**类型透传策略**：`KeyOutcome`、`EditOp`、`CandidateFrame`、`InputStatus`、`CandidateWindow`、`Readiness`、`MobileCommand`、`PressKey`、`KeySource`、`CandidateMenuItem`、`CandidateTooltipSection`、`Phrase`、`UserWord`、`SchemaEntry`、`InstalledSchema`、`ConfigFieldInfo` 等直接透出 `wind-mobile` 类型，不另立投影。
+
+**关于 `HostSession`**：`wind-host` 的 `HostSession` trait 目前**没有实现**，`MobileCore` 也未实现。Phase 1 不依赖它；后续可让 `MobileCore` 实现该 trait，把接缝从"具名方法"升级为"统一 trait"，但这不是本期必需。
+
+### 3.4 线程模型与输入管线（稳定性核心）
+
+**问题**：若每个按键都丢到 `Dispatchers.Default`，多线程执行顺序不确定，后按的键可能先返回，候选/上屏乱序。必须串行。
+
+**模型**：
+
+```
+UI 线程（主）
+  ├─ onTouchEvent / onKeyDown：立即给按键视觉反馈（按下高亮/触感），
+  │   然后把 (seq, key) 投递到输入线程；不在主线程调 Rust
+  └─ 执行 EditOp：从输入线程结果队列按 seq 顺序取出，在主线程执行 InputConnection
+
+输入线程（单线程 HandlerThread / 单线程 Executor）
+  └─ 串行调用 MobileCore：press/key_down/select_candidate/candidates…
+       → 得到 KeyOutcome / CandidateWindow
+       → 投递回主线程（带 seq）
+```
+
+**规则**：
+
+- **单输入线程**：所有 `MobileCore` 调用串行；构造/预热也在该线程，避免与按键抢。
+- **顺序保证**：每个按键带单调递增 `seq`；主线程按 `seq` 执行 EditOp。绝不并发调用 `MobileCore`。
+- **延迟预算**：
+  - 按键视觉反馈：< 8ms（触摸按下即高亮，不等引擎）。
+  - 候选更新：常规 < 50ms；预热后 P95 < 80ms。
+  - 就绪后首键：< 100ms；未就绪时显示"准备中"，不阻塞键盘显示。
+- **背压**：按键队列不丢弃；若引擎阻塞（极少），队列暂存并显示忙碌态。候选拉取可合并，但按键不可合并。
+- **预热**：`MobileCore::new` 在输入线程执行；`onCreateInputView` 立即显示键盘骨架，不等待。`readiness()` 由 UI 轮询/回调驱动"准备中"提示。
+- **禁止**：主线程直接调 `MobileCore::new`、`candidates()`、`key_down()`；禁止多线程并发调 `MobileCore`。
+
+### 3.5 数据目录与资产装配（修正 Android 11+ 存储）
+
+**修正**：v1.0 说 `user_root` 放 `Android/data/<包名>/files` 供用户文件管理器编辑——Android 11+ 分区存储下普通文件管理器无法访问该目录，且卸载即删。改为：
+
+```
+APK assets/data/ ──首次启动──→ filesDir/data-<version>/   (data_dir，只读)
+                                  ↑ 原子解压：临时目录 → 校验 → rename
+user_root = filesDir/user/        (用户配置/词库/短语/剪贴板历史，私有)
+local_root = cacheDir/wind/       (wdat 缓存/日志，可回收)
+```
+
+- **原子解压**：解到 `filesDir/data-tmp-<version>/`，校验文件清单/大小（可选 SHA-256），成功后 `rename` 为 `data-<version>`，再删除旧版本。中断不会留下半解压状态。
+- **升级**：assets 版本号写入 `version` 文件；版本变化才重新解压。
+- **用户可编辑/备份**：不再依赖文件管理器。设置页提供 **SAF 导入/导出**（`ACTION_CREATE_DOCUMENT`/`ACTION_OPEN_DOCUMENT`）：
+  - 配置：`config.toml` 导入导出；
+  - 方案包：`.wdict`/方案文件导入导出（复用 `wind-transfer`）；
+  - 用户词库：`dict_export`/`dict_import`；
+  - 常用语：CSV/JSON 导入导出（Phase 1 可选）。
+- **备份规则**：`android:allowBackup="false"`，或 `dataExtractionRules` 排除 `filesDir/user`（用户词库/剪贴板/短语可能含敏感内容），由用户手动导出。
+- **不申请** `MANAGE_EXTERNAL_STORAGE`；不写公共存储。
+
+### 3.6 构建与编译门
+
+- 新增 `wind-android` 加入 `wind_input/Cargo.toml` 的 `members`，`[lints] workspace = true`。
+- 依赖：`wind-mobile`（path）、`uniffi`（**锁定精确版本**，与 bindgen 一致）、`tracing-android`（`cfg(target_os="android")` 门控）。
+- **UniFFI 流程**：`build.rs` 调 `uniffi::generate_scaffolding`；构建机用 `uniffi-bindgen` 生成 Kotlin 到 `WindInputAndroid/app/src/main/java/.../rust/`；Kotlin 侧依赖 `net.java.dev.jna:jna:5.14.0@aar`。**UniFFI crate 与 bindgen 版本必须完全一致**，否则生成代码不兼容。
+- **编译门**：`cargo check-android` 守护 `wind-mobile` 闭包；`wind-android` 的 FFI 层由 Android 构建脚本真正交叉编译 `.so` 把关。
+- **多 ABI**：`aarch64-linux-android`（主）、`x86_64-linux-android`（模拟器）；按需加 `armv7-linux-androideabi`。
+- **16KB page size**：Android 15+ 要求 native 库 16KB 对齐；链接参数加 `-Wl,-z,max-page-size=16384`（NDK r27 支持）。
+- **minSdk**：建议 26（Android 8.0），覆盖广且 `deleteSurroundingTextInCodePoints` 可用。
+- **compileSdk/targetSdk**：建议 35（Android 15）；当前工具链装的是 platform 34，需补 `platforms;android-35`。
+- **避免新 `-sys` crate**；若必须，CI 配 NDK clang。
+
+---
+
+## 4. Kotlin 宿主层
+
+### 4.1 模块结构
+
+```
+app/src/main/java/com/windinput/ime/
+├── WindImeService.kt              # InputMethodService 主入口
+├── rust/
+│   ├── WindAndroid.kt             # UniFFI 生成绑定（自动，勿手改）
+│   └── RustBridge.kt              # 单输入线程、seq 排序、生命周期、事件分发
+├── input/
+│   ├── InputPipeline.kt           # 按键队列 → 输入线程 → 主线程按序执行
+│   ├── EditOpExecutor.kt          # EditOp → InputConnection（含防护）
+│   └── VkConverter.kt             # KeyEvent/触摸键 → VK
+├── keyboard/
+│   ├── KeyboardView.kt            # 键盘面（自定义 View/Canvas）
+│   ├── KeyboardLayout.kt          # 布局数据模型 + JSON 解析
+│   ├── KeyView.kt                 # 单键渲染/触摸/长按/重复
+│   ├── CandidateBarView.kt        # 编码栏 + 候选栏
+│   └── ToolbarView.kt             # 工具栏
+├── panels/
+│   ├── SymbolPanelView.kt         # 符号/数字层
+│   ├── EmojiPanelView.kt          # 表情面板
+│   ├── ClipboardPanelView.kt      # 剪贴板历史
+│   └── PhrasePanelView.kt         # 常用语
+├── clipboard/ClipboardService.kt  # 实现 AndroidClipboard + 历史监听
+├── event/EventSink.kt             # 实现 AndroidEventSink
+├── settings/
+│   ├── SettingsActivity.kt        # 设置容器
+│   ├── SettingsPages.kt           # 方案/键盘/候选/主题/词库/统计/隐私/关于
+│   └── ConfigUiBuilder.kt         # 由 config_registry() 自动生成控件
+├── onboarding/OnboardingActivity.kt
+├── diag/DiagnosticsActivity.kt    # 日志/版本/自检
+└── util/
+    ├── Threading.kt
+    ├── Haptics.kt
+    └── SafIO.kt                   # SAF 导入导出
+```
+
+### 4.2 ImeService 生命周期与状态机
+
+```
+onCreate
+  → 启动输入线程，构造 WindAndroid（注入 EventSink + ClipboardService）
+  → 立即返回；onCreateInputView 显示键盘骨架
+  → readiness: Idle/Preparing → 显示"词库准备中"轻提示；Ready 后正常
+
+onStartInput(editorInfo, restarting)
+  → core.focus_gained()
+  → 根据 editorInfo 计算：只读/密码/无痕/输入类型
+  → core.set_learning_suspended(密码或 IME_FLAG_NO_PERSONALIZED_LEARNING)
+  → 读光标前文 → core.set_preceding_text()
+  → 切换键盘布局（数字/电话/邮箱/URL 输入类型）
+
+onStartInputView
+  → 请求键盘高度/insets；恢复上次布局与主题
+
+onUpdateSelection
+  → 读光标前文 → core.set_preceding_text()
+  → 若组合区被系统改动，必要时 core.focus_gained() 重置
+
+onKeyDown/onKeyUp
+  → 物理键：VkConverter → key_down；未消费则交还系统
+
+onTouchEvent（键盘 View 内）
+  → 按下：即时高亮 + 触感；抬起：press() 投递输入线程
+
+onFinishInput
+  → core.focus_lost()
+
+onTrimMemory(level)
+  → TRIM_MEMORY_RUNNING_LOW 以上：core.trim_memory()
+
+onDestroy
+  → 停止输入线程，释放 WindAndroid
+```
+
+**状态机**：`Uninitialized → Initializing → Ready | Failed`。`Failed` 时键盘仍可显示但候选为空，并提供"重试/查看日志"。
+
+### 4.3 EditOp → InputConnection（含稳定性防护）
+
+| EditOp | 执行方式 | 防护 |
+|---|---|---|
+| `Commit(text)` | `beginBatchEdit` → `commitText(text,1)` → `endBatchEdit` | 判空 + `isActive` + try/catch |
+| `SetComposition{text,caret}` | `setComposingText(text,1)`；空文本 `finishComposingText()` | 同上；某些 App 不支持组合区时降级为直接 Commit（兼容模式） |
+| `DeleteBackward{count}` | `deleteSurroundingTextInCodePoints(count,0)` | API 24+；失败回退 `deleteSurroundingText` |
+| `ReplaceBackward{count,text}` | `beginBatchEdit` → 删 → `commitText` → `endBatchEdit` | 保证一次撤销回退整段 |
+| `MoveCursor{delta}` | `finishComposingText()` → 相对 `setSelection` | 越界钳制 |
+
+**通用规则**：
+
+- 每次执行前取 `currentInputConnection ?: return`；检查 `view != null`、`isActive`。
+- `InputConnection` 可能失效（切换 App/输入框/Activity 销毁）；异常捕获后丢弃该批 ops，并 `focus_gained()` 重置。
+- `KeyOutcome.consumed == false`：不执行 ops，交还系统默认行为。
+- `KeyOutcome.ops` 按序执行；一批 ops 用 `beginBatchEdit/endBatchEdit` 包裹，保证撤销语义。
+- 候选点选/短语/剪贴板上屏：宿主直接构造 `EditOp::Commit`，**不经过 `press_literal`**（后者只用于文本缓冲模式）。
+
+### 4.4 VK 转换与物理键
+
+- 物理键：`KeyEvent.keyCode` → `wind-keys` VK；修饰键合成 `Modifiers`；`KeyEvent.unicodeChar` 可辅助字符键。
+- 触摸键：只传 `PressKey`（字符/空格/退格/回车），由 `wind-mobile::press` 统一翻译；数字键的"选候选 vs 输入"语义已在 `press` 内处理，Kotlin 不重复判。
+- **吃键判定**：走 `MobileCore::key_down` 内的 `should_handle_key` 唯一真相源；Kotlin 不自己判。
+- 硬件键盘：`onKeyDown` 返回 `false` 时交还系统；注意部分 App 的物理键不经过 IME，需在文档中说明限制。
+
+### 4.5 事件回调与 UI 线程
+
+`AndroidEventSink` 在输入线程/后台线程被调，Kotlin 实现需切主线程：
+
+```kotlin
+class EventSink(...) : AndroidEventSink {
+    private val main = Handler(Looper.getMainLooper())
+    override fun onCandidates(frame: CandidateFrame) = main.post { bar.render(frame) }
+    override fun onStatus(status: InputStatus) = main.post { toolbar.render(status) }
+    override fun onToast(text: String) = main.post { toast(text) }
+    override fun onHideCandidates() = main.post { bar.hide() }
+}
+```
+
+- 推送帧可能高频；UI 侧合并（`bar.render` 只保留最新帧），避免消息队列堆积。
+- 候选列表按需拉取，不在推送回调里做重活。
+
+### 4.6 键盘布局数据模型（新增，扩展性关键）
+
+**不要把布局写死在 Kotlin 代码里**。定义数据驱动布局，26 键/9 键/符号/数字/表情/未来自定义布局共用一套渲染器。
+
+```json
+// assets/keyboard/pinyin26.json（示例）
+{
+  "id": "pinyin26",
+  "name": "拼音 26 键",
+  "type": "char",
+  "rows": [
+    {
+      "keys": [
+        {"label": "q", "code": "q", "width": 1},
+        {"label": "w", "code": "w", "width": 1},
+        {"label": "e", "code": "e", "width": 1}
+      ]
+    },
+    {
+      "keys": [
+        {"action": "shift", "label": "⇧", "width": 1.5},
+        {"label": "a", "code": "a", "width": 1},
+        {"action": "backspace", "label": "⌫", "width": 1.5}
+      ]
+    }
+  ],
+  "bottom": [
+    {"action": "layer", "target": "symbol", "label": "?123", "width": 1.5},
+    {"action": "language", "label": "中/英", "width": 1.5},
+    {"action": "space", "label": "空格", "width": 4},
+    {"action": "enter", "label": "换行", "width": 1.5}
+  ]
+}
+```
+
+- **动作类型**：`char`（字符）、`vk`（显式 VK）、`space`、`backspace`、`enter`、`shift`、`caps`、`layer`（切层）、`panel`（符号/表情/剪贴板/常用语）、`language`（中英/方案）、`voice`（Phase 2）、`settings`、`none`。
+- **每键属性**：`label`、`sublabel`、`popup`（长按弹出符号）、`width`（相对权重）、`style`（普通/功能/强调）、`repeat`（退格连发）、`haptic`。
+- **多布局**：`pinyin26`、`pinyin9`（Phase 2）、`english26`、`symbol`、`numeric`、`phone`、`email`、`url`、`emoji`。
+- **输入类型自适应**：`EditorInfo.inputType` → 选择布局（数字/电话/邮箱/URL/密码）。
+- **尺寸自适应**：宽度按权重分配；横屏/平板限制最大键宽并居中；折叠屏用 `WindowSizeClass`。
+- **与 `wind-softkeyboard` 的区别**：后者是桌面端"符号面板映射表"，**不是**移动端键盘布局，不要混用。
+- **未来**：布局包（JSON）可导入/导出，用户可自定义；布局渲染器与数据解析解耦。
+
+### 4.7 候选栏交互（充分利用已有 API）
+
+- **数据**：优先 `candidates_with_comments(offset, limit)`，拿 `items`、`comments`、`text_segments`、`total`、`selected`、`rebuilt`。
+- **展示**：横向候选，最多 8 条可见；选中项高亮；`comments` 右侧灰字；`text_segments` 按 role 着色（拼音提示）。
+- **分页/滚动**：`total` 判断是否续取；滚动到边界时按 offset 拉取下一窗口（每次 ≤ `MAX_WINDOW=200`）。
+- **`rebuilt=true`**：候选池扩容后前段可能变化，**必须整份重取已显示范围**，不能追加，否则按下标选词会错。
+- **点选**：`select_candidate(absoluteIndex)`；执行返回的 `EditOp`。
+- **长按**：`candidate_menu(index)` → 弹出菜单（置顶/上移/下移/固定/删除/屏蔽/复制等）；`candidate_menu_run(index, action)`。`copy` 由宿主写剪贴板。
+- **详情**：`candidate_tooltip(index)` 展示编码/读音/词频等分段信息。
+- **展开**：展开按钮 → 候选网格面板，按 offset 分页拉取，支持滚动。
+- **联想**：联想候选同样在候选栏展示；`[mobile.association]` 已配置移动端默认（smart/continuous/punct）。
+- **多音字**：`leading_readings`/`set_leading_reading` 供首单元读法修正（可选交互）。
+
+### 4.8 设置页与引导页（新增，复用已有 API）
+
+**引导页（首次启动）**：
+1. 说明输入法用途与隐私（无网络上传）。
+2. 跳转系统"启用输入法"：`Settings.ACTION_INPUT_METHOD_SETTINGS`。
+3. 跳转"选择输入法"：`InputMethodManager.showInputMethodPicker()`。
+4. 试打一段文字，确认候选/上屏正常。
+
+**设置页**（单 Activity + 分组列表，Compose 实现）：
+
+| 分组 | 内容 | 数据来源 |
+|---|---|---|
+| 输入方案 | 拼音/英文/五笔/双拼启用与排序、方案详情（双拼布局、扩展词库、混输成员） | `installed_schemas`、`set_schema_enabled`、`SchemaSettings`、`shuangpin_layouts`、`schema_dicts`、`quick_mix_members` |
+| 键盘 | 26/9 键（9 键 Phase 2）、键盘高度、按键预览、振动、音效、空格长按 | 本地设置 + `config_set` |
+| 候选 | 候选数量、字号、注释、拼音提示、长按菜单开关 | `config_registry`/`config_set` |
+| 主题 | 跟随系统/亮/暗、主题包、强调色 | `themes`、`set_theme`、`theme_style`、`palette` |
+| 词库 | 用户词列表/加词/删词/清空、导入导出 | `user_words`、`user_word_add/remove/clear`、`dict_export/import` |
+| 常用语 | 列表/添加/删除/启用/恢复默认 | `phrases`、`phrase_add/remove/set_enabled/restore_defaults` |
+| 联想 | 开关、历史清理 | `assoc_hold`、`assoc_history_clear` |
+| 统计 | 今日/累计、日曲线、清空 | `stats_summary/stats_daily/stats_clear` |
+| 隐私 | 无痕输入说明、剪贴板历史开关/清空、日志导出、备份规则 | 本地 + `set_learning_suspended` |
+| 关于 | 版本、开源许可（GPL-3.0）、第三方数据声明、项目主页 | 静态 |
+
+**配置 UI 自动生成**：`config_registry()` 返回字段类型/范围/默认值/说明；`ConfigUiBuilder` 按类型生成开关/滑块/下拉/输入框，避免每加一个配置就改设置页。这是长期可扩展性的关键。
+
+### 4.9 UI 设计规范（新增，界面美观性）
+
+**设计原则**：简洁、克制、状态驱动；候选优先，键盘不抢戏；与豆包/微信输入法观感接近，但布局与实现自研。
+
+**尺寸与间距（dp）**：
+- 键盘按键高度：竖屏 48，横屏 42；按键间距 3；键盘左右边距 4。
+- 候选栏高度：44；编码栏 28；工具栏 40。
+- 候选字号：正文 18sp，注释 13sp，拼音提示 14sp；编码串 14sp。
+- 圆角：按键 8；候选栏 12；面板 16。
+- 触控目标：≥ 44×44（功能键可视觉小、热区大）。
+
+**色彩**：
+- 全部取自 `palette(systemDark)` 的语义色（`bg`/`surface`/`text`/`accent_soft`/`toolbar_background` 等），宿主不自记色表。
+- 文本对比度 ≥ 4.5:1；暗色不用纯黑，亮色不用纯白。
+- 选中候选用 `accent_soft` 背景 + 主文本色；注释用次级文本色。
+- 支持跟随系统/强制亮/强制暗；Android 12+ 可选动态取色，但需保证与主题包一致性。
+
+**动效**：
+- 候选栏出现/隐藏 120–160ms ease-out；展开面板 180–220ms；按键按下 60ms。
+- 不使用大幅位移动画；避免与系统输入法窗口动画叠加造成卡顿。
+- 尊重"减少动画"无障碍设置。
+
+**触觉与音效**：
+- 按键用 `View.performHapticFeedback(KEYBOARD_TAP)`，尊重系统设置；不用 `Vibrator` 直连（避免权限与覆盖用户设置）。
+- 音效走 `AudioManager.playSoundEffect`，默认跟随系统；提供开关。
+
+**候选栏信息层级**：
+1. 编码串（左，模式角标 + 编码 + 光标）。
+2. 候选（中，横向滚动，选中高亮）。
+3. 注释/拼音提示（候选内右侧灰字，role 着色）。
+4. 展开/更多（右）。
+5. 页码/滚动指示（候选下方或右侧，弱化）。
+
+**响应式**：
+- 窄屏（<360dp）：候选一次显示 5–6 条，工具栏图标精简。
+- 平板/折叠屏：键盘最大宽度限制并居中；可选左右分栏（Phase 2）。
+- 横屏：降低键高、候选栏单行；不启用系统全屏提取模式（`onEvaluateFullscreenMode` 返回 false）。
+- 多窗口/分屏：随 IME 窗口高度自适应。
+
+**无障碍**：
+- 每个按键设置 `contentDescription`（如"删除""空格""切换到符号"）。
+- 候选支持 TalkBack 朗读（可选 `AccessibilityNodeProvider`）；至少保证可聚焦与文本可读。
+- 支持系统字体缩放（候选字号随 `fontScale` 调整，但有上限避免溢出）。
+- 高对比度模式：加强边框/选中态。
+
+**字体与文本**：
+- 使用系统 sans-serif；不内置 CJK 字体（体积）。
+- 候选文本用系统文本渲染（TextView/Compose Text），支持 emoji/ZWJ/变体选择符；不要自绘文字。
+- 超长候选省略号截断；长按可看 tooltip。
+
+#### 参考视觉风格（据用户提供的微信输入法截图）
+
+- **页面**：浅灰背景（约 `#F2F2F2`）；白色卡片（`#FFFFFF`），圆角 12–16dp，阴影极轻或无。
+- **强调色**：绿色（约 `#07C160`）用于开关开启、选中态、主按钮；主文字近黑（`#1A1A1A`），次要文字灰（`#888888`）。
+- **设置项**：左侧标题 16sp、下方描述 13sp 灰色；右侧开关/箭头；分组标题 14sp 灰色，卡片间距 12–16dp。
+- **键盘**：浅灰底、白色按键、灰色功能键；回车/搜索键用强调色；圆角 8dp；按键按下浅灰/浅绿反馈。
+- **候选栏**：白/浅灰底，候选 18sp；选中项用强调色文字或浅绿背景；注释 13sp 灰色。
+- **工具栏**：圆形图标按钮，横向排列；可展开为多行面板（图标 + 文字）。
+- **实现约束**：以上为参考取值，最终颜色全部映射到 `palette(systemDark)` 语义色；主题可整体替换，不在布局里硬编码颜色。
+
+### 4.10 UI 参考与功能清单（据微信输入法截图提取，供勾选）
+
+> 截图来源：用户提供的微信输入法设置页与键盘页。以下仅提取**功能项**，UI 视觉与代码全部自研，不使用其素材/源码。
+> 优先级：**P1** = 本期最小集；**P1.5** = 核心跑通后快速补；**P2** = 9 键/增强阶段；**P3** = 语音/手写；**P4** = 本地大模型；**不做** = 明确排除。
+> **最终范围以 §0.2 勾选结果为准**；下表"建议"列为初始建议，未逐行改写。
+
+#### A. 输入与键盘
+
+| ID | 功能（截图对应） | 说明 | 建议 |
+|---|---|---|---|
+| A1 | 26 键全拼 + 英文 | 全拼/英文直出/自动空格 | **P1 必做** |
+| A2 | 候选栏 + 编码栏 | 候选点选/翻页/展开 | **P1 必做** |
+| A3 | 中英/标点/全半角/简繁 | 工具栏与语言键 | **P1 必做** |
+| A4 | 候选长按菜单 | 置顶/上移/下移/固定/删除/屏蔽/复制 | P1.5 推荐 |
+| A5 | 候选注释/拼音提示 | `comments` + `text_segments` | P1.5 推荐 |
+| A6 | 输入后联想 | 移动端默认已开（`[mobile.association]`） | **P1 基础** |
+| A7 | 9 键拼音（九宫格） | 引擎级 T9 支持 | P2 |
+| A8 | 九宫格数字/上滑数字/侧边栏 | 9 键布局与手势 | P2 |
+| A9 | 模糊拼音设置 | `wind-engine` 已有模糊音能力 | P2 |
+| A10 | 英文首字母大写/双击空格句号/英文纠错 | 英文输入增强 | P2 |
+| A11 | 中文与数字/英文间加空格 | 辅助输入 | P2 |
+| A12 | 回车键发送 | `imeOptions` action | P2 |
+| A13 | 全键盘数字行/数字输入模式 | 布局与输入类型 | P2 |
+| A14 | 手写找字 | 手写识别输入源 | P3 |
+| A15 | 滑行输入 | 手势输入 | 远期/不做 |
+
+#### B. 布局与显示
+
+| ID | 功能（截图对应） | 说明 | 建议 |
+|---|---|---|---|
+| B1 | 候选字大小 | 滑杆，实时预览 | **P1** |
+| B2 | 键盘高度调节 | 滑杆/预设 | **P1** |
+| B3 | 深色模式（跟随系统/浅色/深色） | 主题联动 | **P1** |
+| B4 | 拼音显示位置（输入框/候选栏） | 对应 `preedit_display` | **P1** |
+| B5 | 键盘上显示表情键 | 开关 | **P1** |
+| B6 | 全键盘按键气泡 | 长按/按下气泡 | P1.5 |
+| B7 | 九宫格侧边栏（拼音/数字） | 9 键专属 | P2 |
+| B8 | 单手模式 | 键盘偏移/缩放 | P2 |
+| B9 | 悬浮键盘/键盘调节 | 浮动窗口 | P2 |
+| B10 | 字体滤镜/排版成图 | 社交玩法 | 不做 |
+
+#### C. 按键效果
+
+| ID | 功能（截图对应） | 说明 | 建议 |
+|---|---|---|---|
+| C1 | 声音（开关 + 音量） | 跟随系统铃声模式 | **P1 基础**（开关） |
+| C2 | 触感强度（无/跟随/弱/较弱/适中/较强/强） | 7 档滑杆 | **P1 基础**（开关）；滑杆 P1.5 |
+| C3 | 按键气泡 | 同 B6 | P1.5 |
+
+#### D. 辅助输入
+
+| ID | 功能（截图对应） | 说明 | 建议 |
+|---|---|---|---|
+| D1 | 回车键发送 | 同 A12 | P2 |
+| D2 | 中文和数字间加空格 | 文本后处理 | P2 |
+| D3 | 中文和英文间加空格 | 文本后处理 | P2 |
+| D4 | 短信验证码自动填充 | 需短信权限，隐私敏感 | P2/评估 |
+| D5 | 英文首字母自动大写 | 英文增强 | P2 |
+| D6 | 双击空格输入句号 | 英文增强 | P2 |
+| D7 | 模糊拼音 | 9 键/全拼均可用 | P2 |
+| D8 | 英文单词自动改正 | 英文增强 | P2 |
+| D9 | 输入后联想 | 同 A6 | **P1 基础** |
+
+#### E. 工具与面板
+
+| ID | 功能（截图对应） | 说明 | 建议 |
+|---|---|---|---|
+| E1 | 剪贴板（候选栏快速使用 + 历史，默认关） | `HostServices` + 宿主历史 | **P1** |
+| E2 | 常用语（编码 + 面板，与剪贴板同界面 Tab） | 复用 `wind-store` 短语 | **P1** |
+| E3 | 表情面板 | `emoji_modules` | **P1** |
+| E4 | 符号面板/数字层 | 布局 JSON + 符号数据 | **P1** |
+| E5 | 工具栏定制 | 功能固定在工具栏 | P2 |
+| E6 | 语音转文字 | 异步输入源 | P3 |
+| E7 | 边写边译/翻译 | 翻译扩展 | P3 |
+| E8 | 手写找字 | 同 A14 | P3 |
+| E9 | AI 录音笔/问 AI/文字整理/灵动表达 | LLM 增强 | P4/评估 |
+| E10 | 跨设备粘贴同步 | 云同步 | 不做 |
+| E11 | 小程序/隔空传送 | 生态功能 | 不做 |
+| E12 | 换机助手/备份还原 | 词库/配置导入导出 | P2（SAF 导入导出 P1 可选） |
+| E13 | 拼写 Plus（表情/颜文字/智能推荐） | 增强候选 | P2/评估 |
+
+#### F. 设置与隐私
+
+| ID | 功能（截图对应） | 说明 | 建议 |
+|---|---|---|---|
+| F1 | 主设置页（功能/设置/更多分组） | 卡片式入口 | **P1** |
+| F2 | 布局和显示页 | B1–B5 | **P1** |
+| F3 | 按键效果页 | C1–C3 | **P1** |
+| F4 | 辅助输入页 | D1–D9 | P1.5/P2 |
+| F5 | 剪贴板页（含常用语 Tab） | E1/E2 | **P1** |
+| F6 | 键盘管理（全键盘/九宫格/手写/五笔/双拼/笔画） | P1 只列拼音/英文；其余 P2 | **P1 部分** |
+| F7 | 语音转文字设置 | E6 | P3 |
+| F8 | 隐私与权限页（输入法状态/麦克风/验证码/个人词典） | 状态 + 说明 + 清空 | **P1**（麦克风/验证码项 P2/P3 置灰说明） |
+| F9 | 个人词典管理 | `user_words` | P1.5 |
+| F10 | 验证码设置 | D4 | P2 |
+| F11 | 统计 | `stats_*` | P2 |
+| F12 | 关于/帮助/反馈 | 版本/许可/主页 | **P1** |
+| F13 | 单机模式（无网络） | 基础包本就无网络权限 | **P1**（说明） |
+| F14 | 主题包/皮肤 | 主题包加载 | P2 |
+
+#### G. 引导
+
+| ID | 功能 | 说明 | 建议 |
+|---|---|---|---|
+| G1 | 首次启用引导 | 跳系统设置启用/选择输入法 | **P1** |
+| G2 | 权限与隐私说明 | 无网络/剪贴板默认关 | **P1** |
+| G3 | 试打与自检 | 确认候选/上屏 | **P1** |
+
+> **已确认（2026-11-24）**：
+> - **P1 最小集**：见 §0.2 第一行。
+> - **P1.5 追加**：A4（候选长按菜单）、A5（候选注释/拼音提示）、B6（按键气泡）、C2 滑杆（触感强度）、F9（个人词典管理页）。
+> - **Phase 2（全选）**：A7–A13、B7–B9、C3、D1–D8、E5、F14。
+> - **Phase 3**：E6 语音优先；E7/E8 随后。
+> - **Phase 4**：E9 评估。
+> - **未选/暂缓**：D4（验证码）、E12（备份/换机）、E13（拼写 Plus）、F10（验证码设置）、F11（统计）、F4 中的验证码项。
+> - **不做**：B10、E10、E11、A15（滑行输入）。
+
+---
+
+## 5. 输入方案与常用语
+
+### 5.1 拼音与英文（Phase 1）
+
+- 启用 `data/schemas/pinyin` 与 `english`；`MobileCore::new` 的 `fallback_schema="pinyin"`。
+- 中英切换：`MobileCommand::English` / `SelectSchema`；键盘语言键 + 工具栏。
+- 标点/全半角/简繁：`MobileCommand::TogglePunct/ToggleWidth/ToggleS2t`。
+- 移动端默认行为已由 `[mobile.association]`、`[mobile.grammar]` 配置覆盖（智能联想、持续联想、标点联想、整句语法模型）。
+- 候选注释/拼音提示：`candidates_with_comments` + `text_segments`。
+
+### 5.2 9 键拼音（Phase 2，引擎级）
+
+**现状**：`wind-engine` 支持全拼/双拼/模糊音/纠错，但**没有 T9/九宫格按键映射**。9 键不是 UI 层能单独补的：一个数字键对应 3–4 个字母，需要引擎在"字母集合序列"上做音节切分与候选生成。
+
+**方案（Phase 2 设计文档单列）**：
+1. **输入层**：`KeySequence` 每项是"字母集合"（如 2→abc，3→def）。
+2. **音节解析**：扩展现有拼音 DAG/音节解析，接受"每位置字母集合"，而不是单一字母串；复用现有 `lattice`/`viterbi` 打分。
+3. **性能**：先用字母集合 DAG（正确性优先）；再评估构建 T9 词条索引（数字序列 → 候选）以降低长串开销。
+4. **UI**：`pinyin9.json` 布局（2–9 + 功能键）、候选栏、长按选字母（可选）。
+5. **英文 T9**：可复用同一键序列抽象，Phase 2 后评估。
+6. **不阻塞 Phase 1**：Phase 1 的 `KeyboardLayout` 数据模型、`PressKey` 抽象、候选链路均不假设 26 键，9 键可平滑加入。
+
+### 5.3 常用语（Phase 1，复用现有短语系统）
+
+**修正**：不再新建 `PhraseStore`。桌面/移动共用的短语系统已在 `wind-store`，`wind-mobile` 已暴露：
+
+- `phrases()`：系统 + 用户短语叠加视图，含 `code/text/enabled/is_system/preview`。
+- `phrase_add(code, text)`：加用户短语。
+- `phrase_remove(code, text)`：删用户短语（系统条目会露回）。
+- `phrase_set_enabled(code, text, on)`：开关系统短语。
+- `phrases_restore_defaults()`：系统短语恢复默认。
+
+**Android 侧**：
+- **常用语面板**：列出用户短语（`is_system=false`），点击直接 `EditOp::Commit(text)` 上屏；长按删除/编辑。
+- **管理页**：设置页"常用语"分组，增删改查、启用开关、恢复默认。
+- **编码触发**：短语本身就是"输入 code 出 text"，引擎已支持；用户可在键盘上输入短语编码触发，与桌面一致。
+- **导入导出**（可选）：CSV/JSON ↔ `phrase_add` 批量导入；后续可加。
+- **与桌面互通**：同一份 `wind-store` 数据格式，桌面设置页添加的短语手机可用，反之亦然。
+
+### 5.4 表情与符号（Phase 1/2）
+
+- **表情**：`emoji_modules()` 列出模块（如 emoji/颜文字），`set_emoji_module(id,on)` 开关；面板分类展示，点击 `EditOp::Commit(emoji)`；最近使用本地记录。
+- **符号**：`symbol_keys()` 返回触发键 → 字符；结合 `system.softkeyboard.toml`/标点配置生成符号页；分页展示，点击 Commit。
+- **数字/符号层**：键盘 `layer` 动作切换；布局 JSON 定义。
+- **笔画/生僻字**：`char_strokes()` 已有数据，Phase 2 评估手写/笔画输入。
+
+---
+
+## 6. 剪贴板
+
+### 6.1 HostServices 注入（需 wind-mobile 补门面）
+
+- `Coordinator::set_host_services` 已存在且 `pub`；但 `MobileCore` 未暴露 → 需 `wind-mobile` 补 `set_host_services`（§3.2）。
+- `wind-android` 实现 `HostServices`，转发到 Kotlin `AndroidClipboard`：
+  - `clipboard_set_text` → `setPrimaryClip`
+  - `clipboard_get_text` → `primaryClip`（阻塞版，仅执行动作时用）
+  - `clipboard_get_text_cached` → 缓存版，**绝不阻塞**（按键候选构建期用，契约要求"宁陈旧/宁空，勿等待"）
+- **时序**：必须在首个可能触碰剪贴板的调用之前注入（`OnceLock`，之后不再生效）。
+
+### 6.2 剪贴板面板（默认关闭，与常用语同界面 Tab）
+
+**已确认**：剪贴板历史**默认关闭**，用户在设置中开启；剪贴板与常用语放在**同一个面板**，顶部 **Tab 切换**（「剪贴板 / 常用语」）。
+
+- 监听 `ClipboardManager.addPrimaryClipChangedListener`，记录历史（文本、时间、来源包名可选）。
+- 存储：`filesDir/user/clipboard_history.json`（或 redb/SQLite），限制条数（如 100），可清空。
+- 展示：面板列表，点击 `EditOp::Commit`；长按删除/置顶。
+- **默认关闭**：未开启时不监听、不落盘；开启后才开始记录。设置页提供开关与"清空历史"。
+- **隐私**：
+  - Android 13+ 系统会显示剪贴板预览；输入法读取剪贴板可能触发提示，需在产品文案说明。
+  - 跳过 `ClipDescription.EXTRA_IS_SENSITIVE` 的条目，不记录。
+  - 密码框/无痕模式下暂停记录。
+  - 历史仅本地，不上传；提供开关与一键清空。
+- **Android 版本限制**：Android 10+ 仅前台/聚焦应用可读剪贴板；输入法聚焦时可读。Android 12+ 读取会 toast；不要频繁轮询，只在面板打开/动作执行时读。
+- **与常用语同界面**：Panel 顶部 Tab「剪贴板 / 常用语」；常用语 Tab 复用 `MobileCore::phrases` 与 `phrase_add/remove`，点击直接 `EditOp::Commit(text)`。
+
+---
+
+## 7. 语音与本地大模型（Phase 2+）
+
+### 7.1 设计原则
+
+- **异步、可取消、流式**：语音有部分结果、最终结果、错误、取消；LLM 有生成中、多候选、超时。
+- **扩展面分离**：
+  - **InputSource**：产生文本（语音、手写、OCR）。
+  - **CandidateEnhancer**：对已有候选重排/补全/润色（LLM、个性化排序）。
+  - **Translator**：整段翻译（可选）。
+- **平台无关接口放 `wind-mobile`**，Android 实现在 `wind-android`/Kotlin；未来 iOS 可复用接口。
+
+### 7.2 扩展接口（草案）
+
+```rust
+/// 异步输入源会话。
+pub trait InputSource: Send + Sync {
+    fn id(&self) -> &'static str;                 // "voice" / "handwriting"
+    fn start(&self, ctx: SourceContext) -> SourceHandle;
+}
+
+pub struct SourceContext {
+    pub preceding_text: String,   // 光标前文
+    pub locale: String,           // zh-CN / en-US
+    pub max_duration_ms: u32,
+}
+
+pub trait SourceHandle: Send + Sync {
+    fn cancel(&self);
+    fn events(&self) -> Receiver<SourceEvent>;
+}
+
+pub enum SourceEvent {
+    Partial(String),              // 流式部分结果（显示在组合区，不上屏）
+    Final(String),                // 最终文本（Commit）
+    Candidates(Vec<String>),      // 多候选（可选）
+    Error(String),
+    Cancelled,
+}
+
+/// 候选增强器：在候选拉取后调用，可重排/追加。
+pub trait CandidateEnhancer: Send + Sync {
+    fn id(&self) -> &'static str;                 // "llm-rerank"
+    fn enhance(&self, ctx: EnhanceContext, items: Vec<String>) -> Vec<String>;
+}
+
+pub struct EnhanceContext {
+    pub preceding_text: String,
+    pub composing: String,
+    pub schema: String,
+}
+```
+
+- **上屏统一**：`Final` → 宿主执行 `EditOp::Commit`；`Partial` → `SetComposition`（可选）。
+- **超时/取消**：`max_duration_ms`；用户滑走/切 App 时 `cancel()`。
+- **线程**：源自身线程；事件经通道回输入线程，再按序上屏。
+- **不侵入按键链路**：输入源与按键并列，不改变现有 `press/key_down`。
+
+### 7.3 语音输入（Android 实现）
+
+- **引擎**：优先 Android 13+ 设备端 `SpeechRecognizer.createOnDeviceSpeechRecognizer`；回退标准 `SpeechRecognizer`（可能云端）。
+- **权限**：`RECORD_AUDIO` 运行时权限；首次使用时说明；拒绝则引导设置。
+- **UX**：麦克风键（长按/点击）→ 录音浮层（波形/时长/取消滑动手势）→ 部分结果实时显示在编码区 → 最终 Commit；错误 Toast；完成后回到键盘。
+- **音频焦点**：请求 `AUDIOFOCUS_GAIN_TRANSIENT`；处理蓝牙耳机/有线麦克风；录音时静音按键音。
+- **隐私**：设备端优先；云端需明确开关与告知；不做后台录音；录音文件不落盘（或用后即删）。
+- **网络权限**：仅云端识别 flavor 声明 `INTERNET`；基础 APK 不声明。
+
+### 7.4 本地大模型（候选增强/润色）
+
+- **定位**：`CandidateEnhancer`（候选重排、下一词预测、整句润色），不是主输入源。
+- **推理**：llama.cpp（NDK 编译）或 MediaPipe LLM Inference；量化模型（Q4/Q5）；CPU/NNAPI/GPU 后端按设备能力选择。
+- **模型管理**：
+  - 模型下载（Wi-Fi/用户确认）、SHA-256 校验、版本管理、删除；存 `filesDir/models/`。
+  - 设备能力检查（RAM/CPU/后端）；不满足则禁用并说明。
+  - 内存预算：加载前检查可用内存；低内存不加载；`onTrimMemory` 卸载。
+  - 热/电：推理超时、请求合并、后台不推理。
+- **隐私**：模型与推理全本地；下载后可离线；无输入内容上传。
+- **网络权限**：仅"模型下载"需要；可拆为独立 flavor/动态功能，基础 APK 无网络权限。
+- **降级**：模型不可用/超时 → 直接返回原候选，不阻塞输入。
+
+### 7.5 本期只留接口
+
+- Phase 1 定义 `InputSource`/`CandidateEnhancer` trait 与注册表（空实现），不引入任何模型依赖、不声明麦克风/网络权限。
+- Phase 2 语音；Phase 3 本地大模型（或按优先级调整）。
+
+---
+
+## 8. 稳定性与兼容性
+
+### 8.1 线程与顺序
+
+- 单输入线程串行（§3.4）；主线程按 `seq` 执行 EditOp。
+- 禁止并发调 `MobileCore`；禁止主线程调重方法。
+- 候选拉取可合并；按键不合并、不丢弃。
+
+### 8.2 InputConnection 兼容矩阵
+
+| 场景 | 风险 | 应对 |
+|---|---|---|
+| WebView/浏览器 | `setComposingText` 行为差异 | 组合区失败降级直接 Commit；提供"兼容模式"开关 |
+| 终端/游戏 | 不支持组合区/`deleteSurroundingText` | 兼容模式下直接 Commit；退格回退 `sendKeyEvent` |
+| 密码框 | 不能学习/联想 | `set_learning_suspended(true)`；强制英文/数字布局；不出候选 |
+| 无痕/私密 | 不能写用户数据 | `IME_FLAG_NO_PERSONALIZED_LEARNING` → 暂停学习 |
+| 多窗口/分屏 | IME 高度/insets 变化 | `onComputeInsets` 正确上报；布局自适应 |
+| 横屏 | 全屏提取模式 | `onEvaluateFullscreenMode=false`；降低键高 |
+| 折叠屏/平板 | 宽度过大 | 限制最大键宽/居中；Phase 2 分栏 |
+
+- **EditorInfo 适配**：`inputType` 数字/电话/邮箱/URL/密码 → 切布局；`imeOptions` action（Send/Search/Go/Next/Done）→ 回车键文案与 `performEditorAction`。
+- **包名**：`editorInfo.packageName` 可用于按 App 记忆布局/兼容模式（Phase 2）。
+
+### 8.3 进程与内存
+
+- **进程被杀**：IME 进程可能被系统回收；`onCreate` 重建 `WindAndroid`，从配置恢复激活方案；用户词/短语已落盘（框架保证）。
+- **`onTrimMemory`**：调用 `core.trim_memory()`（新增门面）→ 淘汰闲置方案/缓存；释放候选池；必要时清日志缓冲。
+- **内存预算**：稳态目标 < 150MB RSS；峰值 < 250MB；大模型另算（不加载时不计）。
+- **预热调度**：`MobileCore::new` 内已 `prepare()+prewarm_single_initials()`；在输入线程执行，不阻塞键盘显示；低电量/低内存设备可延后（后续加策略）。
+- **词库 mmap**：框架已用 mmap/redb；移动端不锁页、不预加载（默认策略）。
+
+### 8.4 崩溃、ANR 与日志
+
+- **Rust panic**：`panic::set_hook` 写日志；UniFFI 边界 `catch_unwind`；不让 panic 穿透到 Kotlin。
+- **Kotlin 异常**：`Thread.setDefaultUncaughtExceptionHandler` 记录并尽量恢复 IME（重启服务）。
+- **ANR 看门狗**：输入线程心跳；单次调用 > 500ms 记 warn，> 2s 记 error 并提示"输入法繁忙"；> 5s 跳过预热/降级。
+- **日志**：`tracing-android` → logcat；同时写 `cacheDir/wind/logs/` 环形文件（限制大小/数量）。**默认不记录候选/上屏文本**；诊断日志需用户主动开启并脱敏。
+- **诊断页**：版本、方案、就绪状态、内存、最近错误、导出日志（SAF）。
+
+### 8.5 数据完整性
+
+- redb 写入由框架处理；宿主不直接写用户库。
+- 资产解压原子性（§3.5）；配置写入走 `config_set`（框架已有损坏备份/拒绝写保护）。
+- 导入词库/方案前校验格式与引擎类型；失败不改动现有数据。
+- 备份规则排除敏感数据（§3.5）；提供手动导出。
+
+### 8.6 系统与 OEM 兼容
+
+- **Android 版本**：8.0–15（minSdk 26 / target 35）为主；16 预览关注。
+- **OEM**：小米/华为/OPPO/vivo/三星的电池优化可能杀 IME；在引导/FAQ 说明"允许后台运行/自启动"，但**不强制**申请敏感权限。
+- **输入法切换**：`shouldOfferSwitchingToNextInputMethod`/`switchToNextInputMethod`；语言键行为遵循系统。
+- **多用户/工作资料**：IME 在 work profile 可能单独启用；数据目录隔离由系统处理。
+
+---
+
+## 9. 安全与隐私
+
+- **无网络上传**：拼音/英文输入、常用语、剪贴板历史全部本地；基础 APK 不声明 `INTERNET`。
+- **剪贴板**：历史默认关闭或需用户开启；跳过敏感标记；密码/无痕不记录；一键清空。
+- **密码/无痕**：`set_learning_suspended`；不写词频/联想/统计；不出候选（或仅英文直出）。
+- **日志**：默认不记录文本；诊断导出脱敏。
+- **权限最小化**：仅 `BIND_INPUT_METHOD`（服务声明）；振动用 `performHapticFeedback` 不需要 `VIBRATE`；语音 Phase 2 才加 `RECORD_AUDIO`；模型下载 Phase 3 才加 `INTERNET`（可拆 flavor）。
+- **组件导出**：IME Service `exported=true` + `BIND_INPUT_METHOD` 权限；设置/引导 Activity 不导出或加保护。
+- **备份**：`allowBackup=false` 或规则排除用户数据；防止云备份泄露词库/剪贴板。
+- **模型完整性**（Phase 3）：SHA-256/签名校验；私有目录存储；不加载未校验模型。
+- **GPL 合规**：核心为 GPL-3.0；Android 版作为衍生作品同样 GPL-3.0 开源，随 APK 提供源代码获取方式与 NOTICE。
+- **品牌**：遵循 `BRANDING.md`；分支发布需改名并注明非官方。
+
+---
+
+## 10. 仓库结构与构建
+
+```
+windinput-android-dev/
+├── wind_input/                          # 已有核心
+│   └── crates/
+│       └── wind-android/                # ★ 新建：Rust 平台绑定层
+│           ├── Cargo.toml
+│           ├── build.rs                 # UniFFI scaffolding
+│           └── src/
+│               ├── lib.rs               # UniFFI 接口 + WindAndroid 装配
+│               ├── host_services.rs     # HostServices → AndroidClipboard 桥
+│               ├── input_source.rs      # InputSource/CandidateEnhancer（Phase 2）
+│               └── logging.rs           # logcat + panic hook
+├── WindInputAndroid/                    # ★ 新建：Android 工程
+│   ├── settings.gradle.kts
+│   ├── build.gradle.kts
+│   ├── gradle.properties
+│   ├── app/
+│   │   ├── build.gradle.kts
+│   │   └── src/main/
+│   │       ├── AndroidManifest.xml
+│   │       ├── java/com/windinput/ime/  # §4.1 模块
+│   │       ├── res/                     # 布局/字符串/主题/图标
+│   │       └── assets/
+│   │           ├── data/                # 从仓库根 data/ 复制（schemas/config/…）
+│   │           └── keyboard/            # 键盘布局 JSON
+│   ├── scripts/
+│   │   ├── build-rust.sh                # 多 ABI 交叉编译 + 复制 .so
+│   │   ├── gen-bindings.sh              # uniffi-bindgen → Kotlin
+│   │   └── build-apk.sh                 # 一键构建
+│   └── keystore/                        # 签名（不入库）
+└── docs/                                # 已有
+```
+
+**构建流水线**：
+
+1. `gen-bindings.sh`：`cargo run -p wind-android --bin uniffi-bindgen -- generate --library target/.../libwind_android.so --language kotlin --out-dir app/src/main/java`。
+2. `build-rust.sh`：对每个 ABI `cargo build -p wind-android --release --target <abi>`；复制 `.so` 到 `app/src/main/jniLibs/<abi>/`；链接参数含 16KB page。
+3. `build-apk.sh`：`./gradlew assembleDebug` / `bundleRelease`。
+4. **CI**：`cargo check-android` + `cargo test -p wind-mobile` + `./gradlew testDebugUnitTest` + `lint` + `assembleDebug`；缓存 cargo/Gradle；签名仅 release job。
+
+**体积预算**：
+- 数据 assets 约 15MB（全部方案）；可裁剪为拼音+英文子集（约 7MB）后续优化。
+- Rust `.so` 每 ABI 约 5–10MB；用 `strip=true`/`lto`/`panic=abort`（框架 release profile 已配）。
+- 基础 APK 目标 ≤ 35MB（含单 ABI + 全量数据）；AAB 按 ABI 分发可降至 ~25MB。
+- UniFFI JNA 约 2MB；可接受。若后续体积敏感，评估直接 JNI 替换热路径。
+
+**版本**：`versionName` 取框架版本；`versionCode` 单调递增；数据版本独立（assets version），升级时按需重解压。
+
+---
+
+## 11. 实施计划（按已确认决策收敛为最小集）
+
+| 阶段 | 内容 | 验证标准 |
+|---|---|---|
+| **P0 绑定层骨架** | `wind-android` crate、UniFFI 接口、`wind-mobile` 4 个薄门面、单输入线程、数据目录/原子解压、日志/panic；Kotlin 工程骨架（ImeService/RustBridge/EventSink） | `cargo check -p wind-android --target aarch64-linux-android` 通过；生成 Kotlin 绑定；APK 可安装并启用 |
+| **P1 输入管线 + 26 键** | InputPipeline（seq 排序）、EditOpExecutor（防护）、VkConverter、键盘布局 JSON（26 键/符号/数字）、候选栏/编码栏骨架 | 26 键打字，候选更新、上屏正确；横竖屏切换状态保持；无 ANR/崩溃 |
+| **P2 拼音+英文** | 启用 pinyin/english；候选翻页/点选/注释；中英/标点/全半角/简繁；`[mobile.*]` 默认；表情入口 | 拼音候选正确、英文直出、模式切换符合预期；`cargo check-android` 通过 |
+| **P3 剪贴板+常用语** | `HostServices` 注入；同面板顶部 Tab（剪贴板/常用语）；剪贴板默认关闭、用户开启；常用语增删改查与点击上屏 | 剪贴板复制粘贴可用、默认不记录；常用语与桌面互通；Tab 切换正常 |
+| **P4 最小设置+引导** | 主设置页、布局与显示（B1–B5）、按键效果（C1–C2 开关）、剪贴板/常用语页、键盘管理（仅拼音/英文）、隐私页、关于、引导页（G1–G3） | 设置即时生效；首次引导可完成启用/试打；隐私说明完整 |
+| **P5 UI 打磨 + 稳定性** | 候选栏/键盘视觉、深色模式、动效、触感；InputConnection 兼容、onTrimMemory、看门狗、进程重建；性能/内存达标 | 视觉验收；目标 App 矩阵通过；连续输入 30 分钟无 ANR/崩溃；内存/延迟达标 |
+| **P6 发布** | 签名、体积优化、GPL 合规、文档、CI 产物 | 可分发 APK/AAB；许可与源码声明齐全 |
+
+**P1.5 已确认追加**（P2 前后穿插）：候选长按菜单、候选注释/拼音提示、按键气泡、触感强度滑杆、个人词典管理页。
+
+**Phase 2（9 键与增强，全选）**：9 键拼音（引擎级）、9 宫格数字/侧边栏/上滑数字、模糊拼音、英文首字母大写/双击空格句号/自动纠错、中英/数字加空格、回车发送、工具栏定制、单手/悬浮键盘、主题包/皮肤。
+**Phase 3（语音优先）**：语音转文字；手写找字、边写边译随后。
+**Phase 4**：本地大模型候选增强/润色；AI 功能按评估决定。
+**暂缓**：统计页、备份/还原/换机助手、短信验证码、拼写 Plus、跨设备同步、小程序/隔空传送。
+
+---
+
+## 12. 测试与验收
+
+| 层级 | 内容 | 工具 |
+|---|---|---|
+| Rust 单元 | VK 映射、EditOp 生成、UniFFI 类型转换、HostServices 桥 | `cargo test -p wind-android` / `wind-mobile` |
+| Kotlin 单元 | VkConverter、EditOpExecutor（Fake InputConnection）、布局 JSON 解析、配置 UI 生成 | JUnit + Robolectric |
+| 集成 | IME 服务启停、输入框切换、候选/上屏、剪贴板注入 | Instrumentation + `adb shell ime` |
+| 视觉 | 键盘/候选栏在亮暗/字号/横竖屏下的截图 | Paparazzi/Roborazzi（或手工截图基线） |
+| 性能 | 冷启动到键盘可见、首键延迟、按键→候选 P95、内存 | Macrobenchmark、`dumpsys gfxinfo`、`dumpsys meminfo` |
+| 兼容 | Android 8/10/12/13/14/15；小米/华为/OPPO/vivo/三星；微信/QQ/浏览器/终端/游戏/WebView/密码框 | 真机矩阵（至少 3 台主力 + 模拟器） |
+| 稳定性 | monkey/随机输入 1h、进程杀死恢复、低内存 | Monkey、`am kill`、`onTrimMemory` 注入 |
+| 安全 | 无网络请求（基础包）、剪贴板敏感标记、备份排除 | 抓包/Manifest 检查/备份检查 |
+
+**验收基线（Phase 1）**：
+- 冷启动键盘可见 < 300ms（不含词库预热）。
+- 就绪后按键→候选 P95 < 80ms；上屏无丢字/乱序。
+- 连续输入 30 分钟无 ANR/崩溃；内存稳态 < 150MB。
+- 26 键拼音/英文正确；横竖屏切换状态保持；密码框不学习、不出候选。
+
+---
+
+## 13. 风险与应对
+
+| 风险 | 应对 |
+|---|---|
+| **首键阻塞（真机 2.8s）** | 构造/预热在输入线程；键盘骨架立即显示；`readiness()` 提示"准备中"；预热后 P95 < 80ms。 |
+| **ANR/乱序** | 单输入线程 + seq 排序；主线程只执行 EditOp；看门狗。 |
+| **InputConnection 失效** | 判空/`isActive`/异常捕获；失效后 `focus_gained()` 重置；兼容模式。 |
+| **UniFFI 版本/绑定漂移** | 锁定 uniffi 与 bindgen 同版本；生成代码入库或 CI 生成；构建脚本校验。 |
+| **NDK/16KB/多 ABI** | NDK r27；`max-page-size=16384`；arm64+x86_64；CI 真机/模拟器验证。 |
+| **9 键缺失** | Phase 1 明确 26 键；Phase 2 引擎级设计；布局/按键抽象不假设 26 键。 |
+| **数据/隐私** | 私有目录 + SAF；备份排除；剪贴板敏感标记；日志脱敏；基础包无网络权限。 |
+| **OEM 杀进程** | 引导/FAQ 说明；进程重建；不强制敏感权限。 |
+| **体积** | 数据 15MB 可控；ABI 拆分/AAB；strip/LTO；按需裁剪方案。 |
+| **GPL 合规** | Android 版 GPL-3.0 开源；NOTICE；源码获取方式。 |
+| **版权** | 仅参考交互思路，UI/代码自研；不复制开源输入法源码。 |
+
+---
+
+## 14. 明确不做（本期）
+
+- 9 键拼音、手写、滑行输入（Phase 2）。
+- 五笔/双拼/笔画等桌面方案的实际启用（架构支持，设置页可后续开放）。
+- 云同步、账号体系。
+- 皮肤/主题编辑器（先做主题包加载）。
+- 语音识别与本地大模型的**实际实现**（仅留接口，不声明相关权限）。
+- 照搬任何开源安卓输入法源码。
+
+---
+
+## 15. windinput 现有移动端适配工作汇总
+
+> 本节为对 `windinput-android-dev` 仓库的专项调研汇总，梳理框架**目前已完成**的移动端适配工作。
+> 结论：框架已为移动端做了系统性、成体系的适配，Android 版接入是「补平台绑定层 + 宿主实现」，而非从零起步。
+
+### 15.1 架构层面的适配（平台无关性保障）
+
+| 工作 | 位置 | 说明 |
+|---|---|---|
+| **核心层平台无关** | `wind-engine` / `wind-dict` / `wind-candidate` / `wind-config` / `wind-store` 等 | 纯逻辑 crate 平台相关行 = 0，CI 守护「核心 0 平台行」，移动端可直接复用同一份引擎与词库逻辑。 |
+| **表现层协议平台无关** | `wind-ui-types` | `UiCommand`/`UiEvent` 及载荷纯数据，协调器 ↔ 任意前端（桌面/macOS/**Android**）共用。三条红线立约：仅纯数据、依赖过 `cargo check-android`、平台载荷走 cfg 变体。 |
+| **平台分层策略立约** | 根 `AGENTS.md`「平台分层策略」 | 明确「平台代码放哪」的归属表：数据类型→wind-ui-types、纯逻辑→对应 crate、同步 pull 平台能力→`HostServices` trait、桌面渲染→`desktop-ui` feature。为 Android 接入划定边界。 |
+| **`desktop-ui` feature 门控** | `wind-coordinator/Cargo.toml` | `default = ["desktop-ui"]`，`--no-default-features` 即 **headless/Android 形态**——桌面渲染路径（UiManager/剪贴板直通/macOS forwarder）被整体门控掉，移动端闭包不含桌面 UI。 |
+
+### 15.2 移动端门面：wind-mobile crate
+
+这是框架为移动端**专门新建**的 crate，注释明确「平台绑定层（Android: WindInputAndroid/rust/wind-android）只经本 crate 一条 path 依赖对接」。已完成的工作：
+
+| 工作 | 位置 | 说明 |
+|---|---|---|
+| **移动端能力聚合** | `wind-mobile/src/lib.rs` | 把移动端要用的能力（按键翻译、预热、配置四层加载、候选拉取、模式状态等）聚合成**一条依赖边**，平台仓只依赖 `wind-mobile`，核心重构由这里吸收。 |
+| **`MobileCore` 会话门面** | `wind-mobile/src/lib.rs` | 一个实例对应一个输入法服务生命周期，封装协调器构造、按键、候选、命令、主题、配置、统计、短语、用户词、备份等全部移动入口。 |
+| **按键翻译与英文自动空格** | `wind-mobile/src/touch.rs` | `press` 接口：字符键 → VK 翻译、英文词后自动补空格（带句末标点换位）。**原写在 Android Kotlin 里**，收进核心后「宿主只剩把键报上来、执行返回的编辑指令」，行为逐条照搬，避免多平台复制。美式键盘布局与 Android `Punct.US_LAYOUT` 逐项一致。 |
+| **配置读写门面** | `wind-mobile/src/config_api.rs` | 移动端配置读写收口，转发核心 `Config::set_user_value` 的全套讲究（容错解析、损坏即备份、等于默认值不写入），宿主不自己落盘，避免「宿主重写一份必然违反某条」。快照用 TOML，与配置文件同一种表示。 |
+| **方案设置门面** | `wind-mobile/src/schema_settings.rs` | 单个方案设置（双拼布局等）的读/写，落 `schema_overrides/{id}.toml`，**与 PC 同一份落点**，PC 写出的文件移动端能读，反之亦然。 |
+| **候选拉取/选择** | `MobileCore::candidates` / `select_candidate` | 候选帧只给当页，列表由宿主按需拉、按绝对下标选。取代骨架期「合成页内数字键」的做法，支持候选栏滚动。`CandidateWindow` 含 `comments`/`text_segments`/`rebuilt`。 |
+| **候选菜单/提示** | `MobileCore::candidate_menu` / `candidate_menu_run` / `candidate_tooltip` | 桌面右键菜单在手机上的对应物；长按候选可置顶/删除/屏蔽/复制等。 |
+| **短语系统** | `MobileCore::phrases` / `phrase_add` / `phrase_remove` / `phrase_set_enabled` / `phrases_restore_defaults` | 系统+用户短语，落 `wind-store`，与桌面设置页同一份数据；**常用语直接复用**。 |
+| **用户词/统计/备份** | `user_words` / `user_word_add` / `user_word_remove` / `user_words_clear`、`stats_*`、`dict_export/import` | 设置页词库、统计、备份能力已具备。 |
+| **模式状态推送** | `MobileEventSink` / `InputStatus` | 反向通道：候选/状态/提示经回调推给宿主，模式真值（中英/标点/全半角/简繁/方案短称）**由引擎推送而非宿主自记**，避免漂移。 |
+| **工具栏命令** | `MobileCommand` | 中英切换、标点、全半角、简繁、方案选择、重载配置、双拼布局等开关直达引擎，呈现由宿主定。 |
+| **主题调色板** | `MobileCore::palette` / `is_dark` | 返回语义色（`0xAARRGGBB`，Android `Color` 与 iOS `UIColor` 都吃此布局），宿主不自记色表，切明暗时重新取。 |
+| **表情模块** | `MobileCore::emoji_modules` / `set_emoji_module` | 表情模块开关与列表，供表情面板使用。 |
+| **符号键** | `MobileCore::symbol_keys` / `separator_key` | 符号面板/分词键数据。 |
+
+### 15.3 宿主语义类型：wind-host crate
+
+`wind-host` 定义了薄宿主语义类型，但 **`HostSession` trait 目前没有实现者**；Phase 1 的 Android 实际走 `MobileCore` 具名方法。类型仍是契约：
+
+| 工作 | 位置 | 说明 |
+|---|---|---|
+| **`HostSession` trait** | `wind-host/src/lib.rs` | 定义 `should_handle_key` / `process_key` / `snapshot` / `readiness` / `prepare`。**当前未实现**；后续可让 `MobileCore` 实现，统一接缝。 |
+| **`KeyProbe` / `Modifiers`** | `wind-host/src/key.rs` | 按键探针：vk + 修饰位 + 只读上下文。吃键判定与实际处理必须喂同一个探针。 |
+| **`EditOp` / `KeyOutcome`** | `wind-host/src/edit.rs` | 宿主无关的编辑指令流：`Commit`/`SetComposition`/`DeleteBackward`/`ReplaceBackward`/`MoveCursor`。取代宿主侧对 `KeyAction` 的猜测式映射，记录「智能符号配对、回退替换、配对跳出在 Android 上静默失效」的教训。 |
+| **`InputSnapshot`** | `wind-host/src/snapshot.rs` | 输入态快照类型，**当前无产出点**；Phase 1 需在 `MobileCore` 补 `snapshot()`（§3.2）。 |
+| **`Readiness`** | `wind-host/src/ready.rs` | 就绪契约：`Idle`/`Preparing`/`Ready`/`Failed`。真机首键实测 2.8s，宿主据此决定等待或提示。 |
+
+### 15.4 协调器的移动端构造与行为适配
+
+| 工作 | 位置 | 说明 |
+|---|---|---|
+| **`InputProfile` 移动端档位** | `wind-coordinator/src/input_profile.rs` | 平台差异集中：`config_overlay`（叠 `[mobile.*]`）、`digit_enters_english_buffer`、`separator_may_claim_quote`、`pinyin_single_letter_limit`。主机测试可直接构造 `mobile()` 走移动分支。 |
+| **headless 构造器族** | `wind-coordinator/src/construct.rs` | `new_headless` / `new_headless_with_ui` / `new_headless_with_override`：进程内直调，无 IPC。 |
+| **启动预热 + 就绪契约** | `MobileCore::new` → `coord.prepare()` + `prewarm_single_initials()` | 移动端保持开启启动预热（注释记录曾关两次、判断错两次的教训）：未预热方案每次查询都重解析 yaml，实测每键多花 200ms。预热移后台，走 `Readiness` 契约。 |
+| **吃键判定唯一真相源** | `wind-coordinator/src/key_gate.rs` | 「这个键该不该处理」收进核心。Android 接入后出现第三份 FFI 手写谓词，一个会话同形 bug 三次；**Android 已切到本模块，FFI 手写谓词已删除**。 |
+| **无痕学习暂停** | `MobileCore::set_learning_suspended` | 对应 `IME_FLAG_NO_PERSONALIZED_LEARNING` / 密码框；暂停期间照常出候选上屏但不写用户数据。 |
+| **焦点事件映射** | `MobileCore::focus_gained` / `focus_lost` | 对应 `onStartInput` / `onFinishInput`。 |
+| **光标前文上报** | `MobileCore::set_preceding_text` | 对应 `onUpdateSelection` 的 `getTextBeforeCursor`，供联想。 |
+| **软键盘映射表** | `wind-softkeyboard` crate | **注意：这是桌面端「符号面板映射表」**（固定 4 行 QWERTY），不是移动端键盘布局；Android 键盘布局需 Kotlin 侧数据驱动实现（§4.6）。 |
+| **方案常驻与内存策略** | `wind-coordinator/src/schema_residency.rs` | `keep_all_loaded` 策略，移动端可按需淘汰闲置方案引擎。 |
+| **移动端配置覆盖** | `data/config.toml` 的 `[mobile.association]` / `[mobile.grammar]` | 联想 smart/continuous/punct、整句语法模型移动端默认开启；桌面构建无视该域。 |
+
+### 15.5 平台能力注入与依赖隔离
+
+| 工作 | 位置 | 说明 |
+|---|---|---|
+| **`HostServices` 注入缝** | `wind-coordinator/src/host_services.rs` | 协调器逻辑中途同步 pull 的平台能力（剪贴板三方法）。headless 默认 `NullHostServices`（set/get 报错、cached 空串）。`Coordinator::set_host_services` 是 `pub`，但 **`MobileCore` 未暴露**，需补薄门面（§3.2）。 |
+| **用户词库 API 下沉** | `wind-coordinator/src/user_words_api.rs` | 用户词管理从 wind-webdata 下沉到协调器。Android 闭包刻意不含 wind-webdata（带 C 依赖），两端各自委托，语义一致。 |
+| **`WebDataHost` 窄面** | `wind-coordinator/src/web_host.rs` | 设置页数据 RPC 消费宿主能力的窄面；Android 闭包无 C 依赖。 |
+| **统计报表共用** | `wind-store::stats_report` | 与桌面共用一份报表算法。 |
+| **bionic 无 POSIX SHM** | `wind-bridge/src/lib.rs` | `shared_memory_posix` 在 Android 整模块排除；Android 走进程内直调。 |
+| **libc 依赖排除** | `wind-coordinator/Cargo.toml` | `libc` 走 `cfg(all(unix, not(target_os="android")))`，不进 Android 闭包。 |
+| **进程内存探测** | `wind-coordinator/src/process_memory.rs` | Android 与 Linux 共用 `/proc/self/status` 读 `RssAnon`。 |
+| **短语平台名适配** | `wind-phrase/src/lib.rs` | `CURRENT_PLATFORM` 显式判 `"android"`，短语 `platform` 字段正确匹配。 |
+
+### 15.6 编译门与 CI
+
+| 工作 | 位置 | 说明 |
+|---|---|---|
+| **`cargo check-android`** | `wind_input/.cargo/config.toml` | `check -p wind-mobile --target aarch64-linux-android`，守护移动端依赖闭包；**免 NDK 本机可跑**（闭包纯 Rust）。 |
+| **`cargo check-headless`** | 同上 | `check -p wind-coordinator --no-default-features`，host 无 wind-ui 形态的编译门。 |
+| **CI 守护** | CI 配置 | CI 强制两条门 + `cargo tree` 断言 coordinator 无 wind-ui 依赖边；记录 bionic/SHM、`-sys` crate 需 NDK clang。 |
+| **编译门边界** | `.cargo/config.toml` 注释 | `check-android` **不覆盖 FFI 绑定层**（UniFFI/cdylib/tracing-android）；该层由 Android 构建脚本真正交叉编译 `.so` 把关。 |
+
+### 15.7 小结
+
+框架对移动端的适配是**成体系、可复用**的，已覆盖：
+
+- **架构层**：核心平台无关 + 表现层协议 + 平台分层立约 + desktop-ui feature 门控。
+- **门面层**：`wind-mobile` 聚合按键、配置、方案设置、候选、候选菜单、短语、用户词、统计、备份、主题、表情、符号等能力。
+- **语义层**：`wind-host` 定义 `EditOp`/`KeyOutcome`/`KeyProbe`/`Readiness`（`HostSession` 尚未实现）。
+- **协调器层**：`InputProfile` 移动档位、headless 构造器、预热与就绪契约、吃键判定唯一真相源、无痕学习、内存策略、`[mobile.*]` 配置覆盖。
+- **注入与隔离层**：`HostServices` 剪贴板注入、用户词库下沉、WebDataHost 窄面、bionic/SHM/libc 适配。
+- **编译门**：`check-android` / `check-headless` 守护依赖闭包。
+
+**尚未做、需要本方案补的**：`wind-android` 绑定层（UniFFI/cdylib/单输入线程/HostServices 桥）、`wind-mobile` 4 个薄门面（readiness/snapshot/set_host_services/trim_memory）、Kotlin 宿主（ImeService/输入管线/键盘布局/候选/面板/设置/引导）、9 键引擎支持（Phase 2）、语音/LLM 扩展接口。这些正是方案 §3–§7 的主要内容。
+
+---
+
+## 16. 待确认事项（已确认项见 §0.1 / §0.2）
+
+已确认：UI 混合、先 26 后 9、最小集优先、剪贴板默认关闭且与常用语同界面 Tab、minSdk 26、常用语"编码+点击面板"同源、P1.5 追加项、Phase 2 全选、主题包纳入 Phase 2、语音优先（Phase 3）。
+
+仍需确认（不阻塞 P0，可先用默认值推进）：
+
+1. **包名/品牌**：默认 `com.windinput.ime`，沿用"清风输入法"名称与 logo（遵循 BRANDING.md）。是否调整？
+2. **targetSdk**：建议 35（Android 15）；当前工具链装的是 platform 34，需补 `platforms;android-35`。是否同意？
+3. **发布渠道**：默认先 sideload APK；是否计划上架应用商店（影响 targetSdk/隐私声明/签名）？
+4. **CI/签名**：本机工具链已就绪（`.toolchain/`）；CI 可后补，签名密钥不入库。是否按此执行？
+5. **UI 视觉细节**：默认采用参考截图的浅灰底/白卡片/绿色强调风格，并映射到清风主题语义色；是否保留清风现有主题色作为可选主题？
+
+---
+
+## 17. P0 实施进度（2026-11-24）
+
+### 17.1 已完成
+
+| 项 | 结果 |
+|---|---|
+| **本地工具链** | `.toolchain/` 内：Rust 1.100 + `aarch64-linux-android`、JDK 17、Gradle 8.7、Android SDK（platform 34/build-tools 34/platform-tools）、NDK r27；`cargo check-android` 实测通过；`.gitignore` 已排除 |
+| **wind-mobile 薄门面** | 新增 `readiness()`、`current_frame()`、`current_status()`、`snapshot()`、`set_host_services()`、`trim_memory()`；主机侧与 Android target 编译均通过 |
+| **wind-android crate** | 新建 `wind_input/crates/wind-android`（UniFFI 0.32 + cdylib）；镜像 FFI 类型 + 穷尽转换；HostServices/EventSink 桥接；已生成 Kotlin 绑定 |
+| **Android 工程** | 新建 `WindInputAndroid/`（AGP 8.5.2 / Kotlin 1.9.24 / minSdk 26 / target 34）；IME Service、26 键键盘、候选栏、输入管线、剪贴板桥、数据原子解压、引导页 |
+| **构建产物** | `app-debug.apk` 约 21MB：arm64 `libwind_android.so` 10.8MB（16KB LOAD 对齐已验证）+ data assets 13.9MB；只保留 arm64-v8a |
+| **构建脚本** | `scripts/build-rust.sh`、`gen-bindings.sh`、`build-apk.sh`；`source .toolchain/env.sh` 后一键构建 |
+
+### 17.2 关键修正（实施中发现）
+
+- **数据目录实际在仓库根 `data/`**，不是 `wind_input/data`；Gradle Copy 任务与文档已修正。
+- **交叉编译必须显式指定 NDK linker**：否则 `cargo build --target aarch64-linux-android` 会用主机 `/usr/bin/ld` 链接 AArch64 对象（`redb` 报 `EM:183`）。`.toolchain/env.sh` 已加 `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER`、`CC/AR` 与 16KB 链接参数。
+- **UniFFI 不能直接导出 `wind-host`/`wind-mobile` 类型**：`wind-host` 零依赖、`wind-mobile` 不沾绑定框架，且 UniFFI 不支持 `usize` 字段；`wind-android` 用 `Ffi*` 镜像类型 + 穷尽 `match` 转换（新增变体会编译失败，不静默漏接）。
+- **`uniffi-bindgen` 的 `cargo metadata` 会解析无关依赖**（如 rav1e）：用 `--metadata-no-deps` + 离线模式生成，避免卡住/下载无关 crate。
+
+### 17.3 验证状态
+
+- ✅ 主机 `cargo check -p wind-mobile` / `-p wind-android`
+- ✅ Android target `cargo check -p wind-android --target aarch64-linux-android`
+- ✅ `cargo build -p wind-android --release --target aarch64-linux-android`（11MB `.so`）
+- ✅ Kotlin 绑定生成（3976 行）
+- ✅ `gradle :app:assembleDebug` 成功；APK manifest/组件/`.so`/assets 检查通过
+- ⚠️ **尚未真机验证**：当前环境无 adb 设备。首次安装需重点验证初始化、首键、候选上屏、横竖屏、密码框
+- ⚠️ 未做：release 签名、x86_64 模拟器 `.so`、CI、单元/仪器测试
+
+### 17.4 下一步（按 P1 最小集）
+
+1. 真机安装验证（`adb install` + `ime enable/set`），修复运行时问题。
+2. 候选翻页/展开/长按菜单、拼音提示（P1.5）。
+3. 设置页（键盘高度/候选字号/深色/声音/触感/隐私）与引导完善。
+4. 剪贴板/常用语同界面 Tab（默认关）、个人词典。
+5. 单输入线程的候选拉取合并/背压、ANR 看门狗。
+6. 9 键 Phase 2 的引擎级设计。
+
+### 17.5 P1 增量（2026-11-24）
+
+| 项 | 结果 |
+|---|---|
+| **词库数据** | 新增 `WindInputAndroid/scripts/gen-data.sh`（`WIND_BUILD_LOCAL=1 scripts/dev.sh gen-data`）；输出 `build_dev/data` 约 40MB（rime_frost + cn_dicts + ext + 英文 + grammar + pinyin_map + opencc + 五笔/辅助码/注释）；Gradle 优先使用该目录 |
+| **默认方案** | 桌面 config 默认五笔；Android 首次启动自动 `SelectSchema("pinyin")` 并写入用户层，之后尊重用户选择 |
+| **FFI 扩展** | `candidate_menu`/`candidate_menu_run`、`phrases`/`phrase_add`/`phrase_remove`/`phrase_set_enabled`；`FfiError` 扁平错误；`uniffi-bindgen` 改为 host-only `cli` feature（Android 不再编 CLI） |
+| **候选交互** | 长按菜单（置顶/删除/屏蔽/复制）、「更多」展开面板（最多 200 条，处理 `rebuilt`） |
+| **剪贴板/常用语** | 同一 Dialog 顶部 Tab；剪贴板历史默认关闭、开启后记录/清空；常用语复用核心短语系统，支持增删、系统短语启停、点击上屏 |
+| **设置页** | 键盘高度、候选字号、深色模式（跟随/浅/深）、按键声音、触感、剪贴板历史 |
+| **构建** | debug/release 均只 arm64-v8a（x86_64 已按用户要求移除）；debug 约 35MB、release 约 33MB（含完整词库）；16KB 对齐已验证 |
+| **测试** | 新增 `wind-android/tests/session.rs` 主机集成测试：拼音候选、选词 Commit、系统/用户短语、trim/snapshot 全部通过；新增 debug `TestActivity`（多 inputType/imeOptions） |
+| **参考** | 查阅同目录 `yuyan/YuyanIme` 等开源输入法的功能与交互思路（9 键、单手/悬浮、剪贴板联想、常用语），未复制代码/素材 |
+
+**仍未验证**：真机/模拟器运行时（当前无 adb 设备）；CI、性能/兼容矩阵。
+**下一步**：真机冒烟 → 设置页扩展/词库/统计/主题包。
+
+### 17.6 P2 增量（9 键 T9 / 签名 / 设置）
+
+| 项 | 结果 |
+|---|---|
+| **ABI 收敛** | 按用户要求**移除 x86_64**；debug/release 均只 arm64-v8a；debug 35MB、release 33MB（含完整词库 + t9.txt） |
+| **9 键 T9（MVP → 融合）** | `scripts/gen-t9.py` 从 rime-frost 生成 `build_dev/data/t9.txt`（20 万条 / 6.6MB，含全拼）；`wind-mobile/src/t9.rs` 提供索引与前缀查询；FFI 暴露 `t9_available/push/backspace/clear/candidates/commit/commit_outcome/buffer_len`；Kotlin 3×3 数字键盘 + 工具栏 26/9 切换；候选融合与提交见 §17.7 |
+| **设置页** | 在原有键盘高度/候选字号/深色/声音/触感/剪贴板之外，新增 9 键开关、**输入方案切换**、关于/版本/GPL 信息 |
+| **签名** | `keystore.properties` + Gradle `signingConfigs`；仓库本地生成开发用 `keystore/windinput-dev.jks`（`.gitignore` 忽略）；release APK 已签名并通过 `apksigner verify`；模板 `keystore.properties.example` |
+| **测试** | 主机集成测试新增 T9 用例（`64 → 你`、融合候选、`t9_commit_outcome` 产出 Commit、缓冲清空）并通过；release 签名验证通过 |
+| **参考** | 同目录 `yuyan/YuyanIme` 等项目的 9 键/单手/剪贴板联想/常用语交互思路；未复制代码/素材 |
+
+**9 键当前边界**：候选由 T9 索引召回、经引擎 `convert` 排序合并；提交回放全拼走引擎选词
+（学习/联想）。尚未把“数字集合”解析并入拼音 DAG，因此还不是严格意义上的 9 键整句解码。
+
+**仍待完成**：真机运行时验证；物理键盘 `onKeyDown`；密码框强制英文/隐藏候选；
+设置页的词库/统计/主题包；T9 数字集合 DAG；CI/性能/兼容矩阵。
+
+### 17.7 P3 增量（T9 融合 / 设置 / 性能兼容）
+
+| 项 | 结果 |
+|---|---|
+| **T9 与拼音引擎融合** | `t9.txt` 增加全拼字段（6.6MB/20 万条）；`t9_candidates_fused()` 取前 3 个不同全拼交 `EngineManager::convert()`，**引擎候选在前、T9 词表补后**；`t9_commit_outcome()` 把候选全拼回放给引擎（逐字母 `press`）后 `select_candidate`，走与 26 键相同的词频学习/联想；启动时后台线程预加载索引，避免首键同步解析 |
+| **设置页** | 新增「输入方案」列表（`SchemaCache` + `pendingSchemaId`，下次弹出键盘生效）；9 键开关；关于/版本/GPL |
+| **性能（主机侧）** | 26 键候选（`nihao`，20 条）~0.76ms；9 键首键（后台预加载后）~0.01ms；9 键融合候选（21 条）~0.55ms（x86_64 Linux test profile） |
+| **兼容性（静态）** | minSdk 26 / target 34 / arm64-v8a；`aapt dump permissions` 无任何 uses-permission（无网络）；IME service `exported` + `BIND_INPUT_METHOD`，Settings 不导出；`.so` LOAD `Align=0x4000`；`zipalign -c -p 4` 通过；APK Signature v2 验证通过 |
+| **文档** | 过程文档移入 `WindInputAndroid/docs/architecture/`（md + txt），README/TOOLCHAIN/TESTING 同步；架构文档随项目提交 |
+| **仍未验证** | 真机/模拟器运行时、Android 真机内存/首键延迟、OEM 兼容矩阵；x86_64 模拟器产物已移除 |
+
+**T9 融合的边界**：仍是“T9 索引召回 + 引擎候选合并 + 回放提交”，没有把数字集合解析
+并入拼音 DAG；因此 9 键暂无严格整句解码。后续工作：在 `wind-engine/pinyin` 增加
+`LetterSet` 输入层，让音节/词图直接吃“每键字母集合”，从而获得整句、语法与完整学习。
+
+---
+
+*本方案基于对 `windinput-android-dev` 仓库的完整调研与二次核实。核心判断：Android 版是「新建平台绑定层把已有核心接出来」，而非从零开发；但必须尊重框架的真实能力边界（HostSession 未实现、MobileCore 缺 4 个门面、9 键引擎缺失、Android 11+ 存储限制），并在输入管线、布局数据化、设置/引导、稳定性上补齐，才能达到成熟输入法的可扩展性与可靠性。*

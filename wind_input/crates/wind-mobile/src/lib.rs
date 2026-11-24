@@ -50,20 +50,23 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod config_api;
 mod schema_settings;
+mod t9;
 mod touch;
 
 pub use schema_settings::{SchemaSetting, SchemaSettingGroup, SchemaSettingKind, SchemaSettings};
+pub use t9::T9Candidate;
 pub use touch::{KeySource, PressKey};
 
 use wind_bridge::handler::KeyAction as BridgeKeyAction;
 use wind_bridge::handler::{FocusData, KeyEventData, MessageHandler};
 use wind_config::Config;
 use wind_coordinator::{CompositionView, Coordinator, InputProfile, SessionEvent, SessionStatus};
-use wind_host::{KeyProbe, Modifiers};
+use wind_host::{InputSnapshot, KeyProbe, ModeFlags, Modifiers, Readiness};
 use wind_ipc::protocol::{EVENT_KEY_DOWN, FocusLostReason, caret_source};
 use wind_ui_types::{CandidateOp, MenuCmd, MenuItemSpec, MenuKind, UiEvent};
 
@@ -73,6 +76,8 @@ use wind_ui_types::{CandidateOp, MenuCmd, MenuItemSpec, MenuKind, UiEvent};
 /// 要跟着核心同步的映射表，而这张表的漏项是静默的（少接一个变体 = 那个动作在移动端
 /// 悄悄消失，不报错、不掉键，单纯功能没有）。
 pub use wind_host::{EditOp, KeyOutcome, TimingHint};
+/// 平台剪贴板注入面，从协调器原样透出（绑定层实现后经 [`MobileCore::set_host_services`] 注入）。
+pub use wind_coordinator::host_services::HostServices;
 
 /// 候选窗口与它的核心侧硬上限，从协调器原样透出。
 ///
@@ -425,11 +430,22 @@ pub trait MobileEventSink: Send + Sync {
     fn on_toast(&self, text: String);
 }
 
+/// 最近一次推送的输入态（与推送通道同源；供视图重建时读取，不靠缓存旧帧）。
+#[derive(Default)]
+struct LatestState {
+    frame: Option<CandidateFrame>,
+    status: Option<InputStatus>,
+}
+
 /// 输入法核心会话：一个实例对应宿主一个输入法服务的生命周期。
 pub struct MobileCore {
     coord: Arc<Coordinator>,
     /// 预热进行中：泵线程据此丢弃预热产生的候选帧，不让它们闪到用户界面上
     warming: Arc<AtomicBool>,
+    /// 最近一帧候选/状态（泵线程写，宿主经 `current_frame`/`snapshot` 读）
+    latest: Arc<Mutex<LatestState>>,
+    /// 9 键 T9 索引与数字缓冲（懒加载/后台预加载；Phase 2 MVP）
+    t9: Arc<Mutex<t9::T9State>>,
     /// 出厂数据目录。留着是为了配置快照能走**与构造期同一条**四层加载路径
     /// （见 [`MobileCore::config_snapshot`]）——少了它只能读代码默认值，
     /// 设置页会把出厂 config.toml 里的取值显示成默认值。
@@ -517,7 +533,20 @@ impl MobileCore {
             Coordinator::new_session(cfg, Some(data_dir), Some(user_root), InputProfile::mobile());
 
         let warming = Arc::new(AtomicBool::new(true));
-        spawn_session_pump(rx, sink, Arc::clone(&warming));
+        let latest = Arc::new(Mutex::new(LatestState::default()));
+        // 9 键索引在后台预加载：6.6MB/20 万条，解析放在首键会明显卡顿。
+        let t9 = Arc::new(Mutex::new(t9::T9State::default()));
+        {
+            let t9_bg = Arc::clone(&t9);
+            let t9_path = data_dir.join("t9.txt");
+            let _ = std::thread::Builder::new()
+                .name("wind-t9-load".into())
+                .spawn(move || {
+                    let mut g = t9_bg.lock().unwrap_or_else(|e| e.into_inner());
+                    g.preload(&t9_path);
+                });
+        }
+        spawn_session_pump(rx, sink, Arc::clone(&warming), Arc::clone(&latest));
 
         // 设置页每改一项就重载一次：成功不弹「设置已更新」（失败照常提示）
         coord.set_quiet_reload_toast(true);
@@ -541,11 +570,219 @@ impl MobileCore {
         Arc::new(Self {
             coord,
             warming,
+            latest,
+            t9,
             data_dir: data_dir.to_path_buf(),
             auto_spaced: AtomicBool::new(false),
             auto_space: AtomicBool::new(true),
             touch_quick_trigger: AtomicBool::new(false),
         })
+    }
+
+    /// 就绪状态（转发协调器）。宿主据此决定显示「准备中」还是正常候选。
+    pub fn readiness(&self) -> Readiness {
+        self.coord.readiness()
+    }
+
+    /// 最近一帧候选/编码状态。与推送通道同源，供横竖屏切换/视图重建读取。
+    pub fn current_frame(&self) -> Option<CandidateFrame> {
+        self.latest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frame
+            .clone()
+    }
+
+    /// 最近一次模式真值。与推送通道同源。
+    pub fn current_status(&self) -> Option<InputStatus> {
+        self.latest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .status
+            .clone()
+    }
+
+    /// 输入态快照（编码区/分页/模式）。候选文本请按 `current_frame` 的 page 另行拉取。
+    pub fn snapshot(&self) -> InputSnapshot {
+        let g = self.latest.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = g.frame.as_ref();
+        let status = g.status.as_ref();
+        InputSnapshot {
+            preedit: frame.map(|f| f.preedit.clone()).unwrap_or_default(),
+            preedit_caret: frame.map(|f| f.preedit_caret).unwrap_or(0),
+            mode_label: frame.map(|f| f.mode_label.clone()).unwrap_or_default(),
+            candidates: Vec::new(),
+            selected: frame.map(|f| f.selected).unwrap_or(0),
+            page: frame.map(|f| f.page).unwrap_or(0),
+            total_pages: frame.map(|f| f.total_pages).unwrap_or(0),
+            mode: ModeFlags {
+                chinese_mode: status.map(|s| s.chinese_mode).unwrap_or(false),
+                icon_label: status.map(|s| s.icon_label.clone()).unwrap_or_default(),
+                full_width: status.map(|s| s.full_width).unwrap_or(false),
+                chinese_punct: status.map(|s| s.chinese_punct).unwrap_or(false),
+                s2t_enabled: status.map(|s| s.s2t_enabled).unwrap_or(false),
+                s2t_shown: status.map(|s| s.s2t_shown).unwrap_or(false),
+                password_suppress: false,
+            },
+        }
+    }
+
+    /// 注入平台剪贴板实现。必须在首个可能触碰剪贴板的调用之前调用。
+    pub fn set_host_services(&self, svc: Arc<dyn HostServices>) {
+        self.coord.set_host_services(svc);
+    }
+
+    /// 内存紧张时释放闲置资源（Android `onTrimMemory` 调用）。
+    /// 只淘汰非保护方案的引擎与懒建缓存，不动用户库、不打断当前方案。
+    pub fn trim_memory(&self) {
+        use wind_coordinator::web_host::WebDataHost;
+        let mgr = self.coord.engine_mgr();
+        let released = mgr.evict_idle_caches(std::time::Duration::ZERO);
+        let dropped = mgr.evict_idle(std::time::Duration::from_secs(300));
+        if !released.is_empty() || !dropped.is_empty() {
+            tracing::info!(
+                "trim_memory: 释放缓存 {:?}，淘汰方案 {:?}",
+                released,
+                dropped
+            );
+        }
+    }
+
+    /// 9 键索引是否可用（`data_dir/t9.txt` 存在）。
+    pub fn t9_available(&self) -> bool {
+        self.data_dir.join("t9.txt").is_file()
+    }
+
+    /// 9 键：追加一个数字（2-9），返回当前候选。
+    pub fn t9_push_digit(&self, digit: char) -> Vec<T9Candidate> {
+        let path = self.data_dir.join("t9.txt");
+        let mut g = self.t9.lock().unwrap_or_else(|e| e.into_inner());
+        g.push(&path, digit)
+    }
+
+    /// 9 键：退格一个数字，返回当前候选。
+    pub fn t9_backspace(&self) -> Vec<T9Candidate> {
+        let path = self.data_dir.join("t9.txt");
+        let mut g = self.t9.lock().unwrap_or_else(|e| e.into_inner());
+        g.backspace(&path)
+    }
+
+    /// 9 键：清空数字缓冲。
+    pub fn t9_clear(&self) {
+        self.t9
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// 9 键：当前候选。
+    pub fn t9_candidates(&self) -> Vec<T9Candidate> {
+        let path = self.data_dir.join("t9.txt");
+        let mut g = self.t9.lock().unwrap_or_else(|e| e.into_inner());
+        g.candidates(&path)
+    }
+
+    /// 9 键：融合候选。
+    ///
+    /// T9 索引给出“数字串 → 候选词 + 全拼”；取前几个不同读音交给**拼音引擎**
+    /// `convert()`，先放引擎候选（引擎排序/词频/整句），再把 T9 词表里剩余的补在后面。
+    /// 这样 9 键候选与 26 键共享同一套引擎排序，同时保留 T9 的召回。
+    pub fn t9_candidates_fused(&self) -> Vec<T9Candidate> {
+        use wind_coordinator::web_host::WebDataHost;
+
+        let t9 = self.t9_candidates();
+        let mut out: Vec<T9Candidate> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+
+        // 只取前 3 个不同全拼，避免每次按键都查太多引擎路径。
+        let mut pinyins: Vec<String> = Vec::new();
+        for c in &t9 {
+            if !c.pinyin.is_empty() && !pinyins.iter().any(|p| p == &c.pinyin) {
+                pinyins.push(c.pinyin.clone());
+                if pinyins.len() >= 3 {
+                    break;
+                }
+            }
+        }
+        for py in pinyins {
+            let r = self.coord.engine_mgr().convert(&py, 10);
+            for cand in r.candidates {
+                if seen.iter().any(|t| t == &cand.text) {
+                    continue;
+                }
+                seen.push(cand.text.clone());
+                out.push(T9Candidate {
+                    text: cand.text,
+                    weight: cand.weight as i64,
+                    pinyin: cand.pinyin,
+                });
+            }
+        }
+        for c in t9 {
+            if seen.iter().any(|t| t == &c.text) {
+                continue;
+            }
+            seen.push(c.text.clone());
+            out.push(c);
+        }
+        out.truncate(30);
+        out
+    }
+
+    /// 9 键：选择第 N 个候选；只返回要上屏的文本（同时清空数字缓冲）。
+    pub fn t9_commit(&self, index: usize) -> Option<String> {
+        let text = self.t9_candidates_fused().get(index)?.text.clone();
+        self.t9_clear();
+        Some(text)
+    }
+
+    /// 9 键：选择第 N 个候选并**走拼音引擎提交**。
+    ///
+    /// 把候选的全拼回放给引擎（`press` 逐字母），再在引擎候选里找到同文本项并
+    /// `select_candidate`——于是词频学习、联想、下一词都走与 26 键同一条路。
+    /// 找不到/无全拼时降级为直接 `Commit(text)`。
+    pub fn t9_commit_outcome(&self, index: usize) -> Option<KeyOutcome> {
+        let cand = self.t9_candidates_fused().get(index)?.clone();
+        self.t9_clear();
+        let text = cand.text.clone();
+        if cand.pinyin.is_empty() {
+            return Some(KeyOutcome {
+                consumed: true,
+                ops: vec![EditOp::Commit(text)],
+                ..KeyOutcome::default()
+            });
+        }
+
+        // 清掉可能残留的引擎组合区，再把全拼喂给引擎。
+        let _ = self.key_down(wind_keys::keymap::VK_ESCAPE, 0);
+        for ch in cand.pinyin.chars() {
+            let _ = self.press(
+                PressKey::Char {
+                    ch,
+                    shifted: false,
+                },
+                KeySource::Touch,
+            );
+        }
+
+        let win = self.candidates(0, 200);
+        if let Some(pos) = win.items.iter().position(|t| t == &text) {
+            Some(self.select_candidate(win.offset + pos))
+        } else {
+            Some(KeyOutcome {
+                consumed: true,
+                ops: vec![EditOp::Commit(text)],
+                ..KeyOutcome::default()
+            })
+        }
+    }
+
+    /// 9 键：当前数字缓冲长度（宿主据此决定空格/退格是走 T9 还是走引擎）。
+    pub fn t9_buffer_len(&self) -> usize {
+        self.t9
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .buffer_len()
     }
 
     /// 按下键（`vk` = wind-keys VK 码，`modifiers` 见 [`wind_host::Modifiers`]）。
@@ -1501,6 +1738,7 @@ fn spawn_session_pump(
     rx: std::sync::mpsc::Receiver<SessionEvent>,
     sink: Arc<dyn MobileEventSink>,
     warming: Arc<AtomicBool>,
+    latest: Arc<Mutex<LatestState>>,
 ) {
     std::thread::Builder::new()
         .name("wind-session-pump".into())
@@ -1523,17 +1761,31 @@ fn spawn_session_pump(
                         selected,
                         page,
                         total_pages,
-                    }) => sink.on_candidates(CandidateFrame {
-                        preedit,
-                        preedit_caret,
-                        mode_label,
-                        composing,
-                        has_candidates,
-                        selected,
-                        page,
-                        total_pages,
-                    }),
-                    SessionEvent::Hide => sink.on_hide_candidates(),
+                    }) => {
+                        let frame = CandidateFrame {
+                            preedit,
+                            preedit_caret,
+                            mode_label,
+                            composing,
+                            has_candidates,
+                            selected,
+                            page,
+                            total_pages,
+                        };
+                        // 先记最近帧再回调：宿主在回调里重建视图时也能读到同一帧。
+                        latest
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .frame = Some(frame.clone());
+                        sink.on_candidates(frame);
+                    }
+                    SessionEvent::Hide => {
+                        latest
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .frame = None;
+                        sink.on_hide_candidates();
+                    }
                     SessionEvent::Status(SessionStatus {
                         chinese_mode,
                         latin_input,
@@ -1542,15 +1794,22 @@ fn spawn_session_pump(
                         chinese_punct,
                         s2t_enabled,
                         s2t_shown,
-                    }) => sink.on_status(InputStatus {
-                        chinese_mode,
-                        latin_input,
-                        icon_label,
-                        full_width,
-                        chinese_punct,
-                        s2t_enabled,
-                        s2t_shown,
-                    }),
+                    }) => {
+                        let status = InputStatus {
+                            chinese_mode,
+                            latin_input,
+                            icon_label,
+                            full_width,
+                            chinese_punct,
+                            s2t_enabled,
+                            s2t_shown,
+                        };
+                        latest
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .status = Some(status.clone());
+                        sink.on_status(status);
+                    }
                     // 桌面的 toast 与状态气泡在核心里已合为一条 Notice
                     SessionEvent::Notice(text) => sink.on_toast(text),
                 }
