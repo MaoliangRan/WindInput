@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标单色层（Android 13+ 主题图标）：系统按 alpha 取形并着色
+     几何与前景层保持一致 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+
+    <!-- W 主体 -->
+    <path
+        android:pathData="M 318.5,375.5 L 399.5,675.5 L 491,443 L 582.5,675.5 L 663.5,375.5"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="78"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+
+    <!-- 橙色圆点位（单色下与字母同色） -->
+    <path
+        android:pathData="M 693.5,335 a 25.5,25.5 0 1,0 51,0 a 25.5,25.5 0 1,0 -51,0"
+        android:fillColor="#FFFFFFFF" />
+</vector>
